@@ -216,7 +216,6 @@ def main_loop(reader, mappings):
             (status, uid) = reader.MFRC522_Anticoll()
             if status == reader.MI_OK:
                 logging.info(f"Raw UID bytes: {uid}")
-                # Convert UID bytes to an integer using all 5 bytes
                 uid_int = int.from_bytes(uid, byteorder='big')
                 uid_str = str(uid_int).strip()
                 logging.info(f"Card read UID: {uid_str}")
