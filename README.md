@@ -1,5 +1,8 @@
-![Nanopc_Rfid](https://github.com/mrchrisster/rfid_spotify/blob/main/media/PXL_20240529_172146660~2.jpg) 
-![Sample_tags](https://github.com/mrchrisster/rfid_spotify/blob/main/media/Screenshot_13.png)
+
+<p float="left">
+  <img src="https://github.com/mrchrisster/rfid_spotify/blob/main/media/PXL_20240529_172146660~2.jpg" width="100" />
+  <img src="https://github.com/mrchrisster/rfid_spotify/blob/main/media/Screenshot_13.png" width="100" /> 
+</p>
 
 # Spotify RFID Player
 
