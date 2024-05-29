@@ -23,6 +23,7 @@ Compile for SPI support:
 - Compile Kernel with [SPI enabled](https://wiki.friendlyelec.com/wiki/index.php/SPI)
 - The only version working for me where WLAN was enabled and SPI was working is rk3399-eflasher-friendlycore-focal-4.19-arm64-20240511.img
 - After trying out different environments to compile the kernel, I found WSL with Ubuntu 20.04.6 LTS to work well
+- Make sure you install the [dev environment](https://github.com/friendlyarm/build-env-on-ubuntu-bionic)
 - Use [SD Fuse tools](https://github.com/friendlyarm/sd-fuse_rk3399) to compile  with `./build-kernel.sh friendlycore-focal-arm64`
 
 Or simply Download for SPI enabled version:
