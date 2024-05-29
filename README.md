@@ -1,7 +1,7 @@
 
 <p float="left">
-  <img src="https://github.com/mrchrisster/rfid_spotify/blob/main/media/PXL_20240529_172146660~2.jpg" width="300" />
-  <img src="https://github.com/mrchrisster/rfid_spotify/blob/main/media/Screenshot_13.png" width="300" /> 
+  <img src="https://github.com/mrchrisster/rfid_spotify/blob/main/media/PXL_20240529_172146660~2.jpg" width="500" />
+  <img src="https://github.com/mrchrisster/rfid_spotify/blob/main/media/Screenshot_13.png" width="500" /> 
 </p>
 
 # Spotify RFID Player
