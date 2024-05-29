@@ -28,7 +28,7 @@ Compile for SPI support:
 
 Or simply Download for SPI enabled version:
   If you want to use my precompiled image for the Nanopc T4 with SPI and Wifi enabled, [download here](https://drive.google.com/file/d/1pRt_ehEy8QNT3_qfBpB8euX4WRCSb2db/view?usp=sharing)  
-  Download the [rk3399-eflasher-friendlycore-focal-4.19-arm64-20240511.img image](https://download.friendlyelec.com/NanoPC-T4) and flash to SD card with Win32DiskImager (make sure Google Drive for Desktop is disabled if you use it or else the software doesn't launch)  
+  Download the rk3399-eflasher-friendlycore-focal-4.19-arm64-20240511.img [image](https://download.friendlyelec.com/NanoPC-T4) and flash to SD card with Win32DiskImager (make sure Google Drive for Desktop is disabled if you use it or else the software doesn't launch)  
   Now replace the friendlycore-focal-arm64 folder 
   
 Software:
