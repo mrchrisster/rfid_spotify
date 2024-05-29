@@ -109,7 +109,7 @@ Software:
 - Click on Edit and add `http://localhost:8888/callback` to the redirect URIs
 - Add CLIENT_ID and CLIENT_SECRET to spotify_play.py
   
-When you first launch rfid_reader.py and swipe a card that links to a spotify track, you will see in the output:  
+- When you first launch rfid_reader.py and swipe a card that links to a spotify track, you will see in the output:  
 `Please navigate to the following URL to authenticate: https://accounts.spotify.com/authorize?client_id=3353ad...`  
 - Copy that URL to a browser (make sure you are logged in to spotify here) and push enter
 - It will fail to open a site but that doesn't matter
