@@ -4,7 +4,8 @@
 
 ## What is it?
 **Tap a card and listen to a song on Spotify (like a Yoto just free)**  
-This is a simple set of scripts to use a RFID-RC522 with a FriendlyELEC Nanopc-t4 or Raspberry Pi (I have an old Raspberry Pi 1b I use it with)
+This is a simple set of scripts to use a RFID-RC522 with a FriendlyELEC Nanopc-t4 or Raspberry Pi (I have an old Raspberry Pi 1b I use it with)  
+This is a fun little project for my son's bedtime routine. I have printed a set of cards with his favorite audiobooks he can choose and listen to to fall asleep.  
 
 
 ## Wiring RFID-RC522 to NanoPC-T4
@@ -98,7 +99,12 @@ Software:
     ```
     If everything installed correctly, you now try and run the script:
     `sudo python3 rfid_reader.py`
+    Swipe a RFID card and observe the code. Now put this code into rfid_tracks.csv
+    To find the URI for an album or track on Spotify, check [here](https://support.spotify.com/us/artists/article/finding-your-artist-url/)
 
+## Spotipy setup
+Go to [Spotify developer portal](https://developer.spotify.com/dashboard)
+When you first launch rfid_reader.py and swipe a card that links to a spotify track, 
 
 
 
