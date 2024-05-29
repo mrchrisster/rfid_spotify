@@ -69,6 +69,28 @@ Environment="PYTHONUNBUFFERED=1"
 WantedBy=multi-user.target
 ```
 
+
+## Spotipy setup
+- Go to [Spotify developer portal](https://developer.spotify.com/dashboard)
+- In your spotify test app go to settings and write down Client ID and client secret.
+- Click on Edit and add `http://localhost:8888/callback` to the redirect URIs
+- Add CLIENT_ID and CLIENT_SECRET to spotify_play.py
+  
+- When you first launch rfid_reader.py and swipe a card that links to a spotify track, you will see in the output:  
+`Please navigate to the following URL to authenticate: https://accounts.spotify.com/authorize?client_id=3353ad...`  
+- Copy that URL to a browser (make sure you are logged in to spotify here) and push enter
+- It will fail to open a site but that doesn't matter
+- Just copy the link that it created and feed it back into spotify_play.py. It should say `Enter the URL you were redirected to:`
+- Done. You have successfully authenticated Spotify on your device
+  
+- In the debug settings you should now see available devices, like
+  ```
+  DEBUG:spotipy.client:RESULTS: {'devices': [{'id': 'd5ccf364d7d8aea34c812b', 'is_active': False, 'is_private_session': False, 'is_restricted': False, 'name': 'SHIELD', 'supports_volume': True, 'type': 'TV', 'volume_percent': 46}, {'id': '687d09a07390b9e6a993232679', 'is_active': False, 'is_private_session': False, 'is_restricted': False,
+  ```
+- Find your device you want to play songs on and update `DESIRED_DEVICE_NAME` in spotify_play.py
+
+  
+
 ## Wiring RFID-RC522 to Raspberry Pi
   
 Find the pinout for your raspberry pi and connect all connections except for IRQ.  
@@ -102,25 +124,6 @@ Software:
     `sudo python3 rfid_reader.py`
     Swipe a RFID card and observe the code. Now put this code into rfid_tracks.csv
     To find the URI for an album or track on Spotify, check [here](https://support.spotify.com/us/artists/article/finding-your-artist-url/)
-
-## Spotipy setup
-- Go to [Spotify developer portal](https://developer.spotify.com/dashboard)
-- In your spotify test app go to settings and write down Client ID and client secret.
-- Click on Edit and add `http://localhost:8888/callback` to the redirect URIs
-- Add CLIENT_ID and CLIENT_SECRET to spotify_play.py
-  
-- When you first launch rfid_reader.py and swipe a card that links to a spotify track, you will see in the output:  
-`Please navigate to the following URL to authenticate: https://accounts.spotify.com/authorize?client_id=3353ad...`  
-- Copy that URL to a browser (make sure you are logged in to spotify here) and push enter
-- It will fail to open a site but that doesn't matter
-- Just copy the link that it created and feed it back into spotify_play.py. It should say `Enter the URL you were redirected to:`
-- Done. You have successfully authenticated Spotify on your device
-  
-- In the debug settings you should now see available devices, like
-  ```
-  DEBUG:spotipy.client:RESULTS: {'devices': [{'id': 'd5ccf364d7d8aea34c812b', 'is_active': False, 'is_private_session': False, 'is_restricted': False, 'name': 'SHIELD', 'supports_volume': True, 'type': 'TV', 'volume_percent': 46}, {'id': '687d09a07390b9e6a993232679', 'is_active': False, 'is_private_session': False, 'is_restricted': False,
-  ```
-- Find your device you want to play songs on and update `DESIRED_DEVICE_NAME` in spotify_play.py
 
 
 
