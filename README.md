@@ -28,7 +28,9 @@ Compile for SPI support:
 
 Or simply Download for SPI enabled version:
   If you want to use my precompiled image for the Nanopc T4 with SPI and Wifi enabled, [download here](https://drive.google.com/file/d/1pRt_ehEy8QNT3_qfBpB8euX4WRCSb2db/view?usp=sharing)
-
+  Download the [image](https://download.friendlyelec.com/NanoPC-T4) and flash to SD card with Win32DiskImager (make sure Google Drive for Desktop is disabled if you use it or else the software doesn't launch)
+  Now replace the friendlycore-focal-arm64 folder 
+  
 Software:
   - Once you have the nanopc up and running, double check with `ls /dev/spi*` that your SPI device is running and active
   - Next we need a special version of wiringpi for the nanopc t4. Install these two versions: [Main install](https://wiki.friendlyelec.com/wiki/index.php/WiringPi_for_RK3399)) and [python wrapper](https://wiki.friendlyelec.com/wiki/index.php/WiringPi-Python_for_RK3399)
