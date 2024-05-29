@@ -49,7 +49,7 @@ Software:
     If everything installed correctly, you now try and run the script:
     `sudo python3 rfid_reader.py`
     Swipe a RFID card and observe the code. Now put this code into rfid_tracks.csv
-    To find the URI for an album or track on Spotify, check [here](https://support.spotify.com/us/artists/article/finding-your-artist-url/)
+    To find the URI for an album, playlist or track on Spotify, check [here](https://support.spotify.com/us/artists/article/finding-your-artist-url/)
 
 Autostart:
 `nano /etc/systemd/system/rfid.service`
@@ -125,7 +125,7 @@ Software:
     If everything installed correctly, you now try and run the script:
     `sudo python3 rfid_reader.py`
     Swipe a RFID card and observe the code. Now put this code into rfid_tracks.csv
-    To find the URI for an album or track on Spotify, check [here](https://support.spotify.com/us/artists/article/finding-your-artist-url/)
+    To find the URI for an album, playlist or track on Spotify, check [here](https://support.spotify.com/us/artists/article/finding-your-artist-url/)
 
 
 
