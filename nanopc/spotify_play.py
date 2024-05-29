@@ -25,6 +25,9 @@ def play_content(sp, device_id, uri):
     elif uri.startswith('spotify:album'):
         sp.start_playback(device_id=device_id, context_uri=uri)
         logging.info(f"Playing album {uri} on device {DESIRED_DEVICE_NAME}")
+    elif uri.startswith('spotify:playlist'):
+        sp.start_playback(device_id=device_id, context_uri=uri)
+        logging.info(f"Playing playlist {uri} on device {DESIRED_DEVICE_NAME}")
 
 def main():
     if len(sys.argv) != 2:
