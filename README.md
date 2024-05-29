@@ -115,7 +115,9 @@ When you first launch rfid_reader.py and swipe a card that links to a spotify tr
 - It will fail to open a site but that doesn't matter
 - Just copy the link that it created and feed it back into spotify_play.py. It should say `Enter the URL you were redirected to:`
 - Done. You have successfully authenticated Spotify on your device
-
+  
+- In the debug settings you should now see available devices, like `DEBUG:spotipy.client:RESULTS: {'devices': [{'id': 'd5ccf364d7d8aea34c81a34c602d25bcddb5812b', 'is_active': False, 'is_private_session': False, 'is_restricted': False, 'name': 'SHIELD', 'supports_volume': True, 'type': 'TV', 'volume_percent': 46}, {'id': '687d09a07390b7812e92fda0c6f9e6a993232679', 'is_active': False, 'is_private_session': False, 'is_restricted': False,`
+- Find your device you want to play songs on and update `DESIRED_DEVICE_NAME` in spotify_play.py
 
 
 
