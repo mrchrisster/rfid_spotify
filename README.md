@@ -103,8 +103,18 @@ Software:
     To find the URI for an album or track on Spotify, check [here](https://support.spotify.com/us/artists/article/finding-your-artist-url/)
 
 ## Spotipy setup
-Go to [Spotify developer portal](https://developer.spotify.com/dashboard)
-When you first launch rfid_reader.py and swipe a card that links to a spotify track, 
+- Go to [Spotify developer portal](https://developer.spotify.com/dashboard)
+- In your spotify test app go to settings and write down Client ID and client secret.
+- Click on Edit and add `http://localhost:8888/callback` to the redirect URIs
+- Add CLIENT_ID and CLIENT_SECRET to spotify_play.py
+  
+When you first launch rfid_reader.py and swipe a card that links to a spotify track, you will see in the output:  
+`Please navigate to the following URL to authenticate: https://accounts.spotify.com/authorize?client_id=3353ad...`  
+- Copy that URL to a browser (make sure you are logged in to spotify here) and push enter
+- It will fail to open a site but that doesn't matter
+- Just copy the link that it created and feed it back into spotify_play.py. It should say `Enter the URL you were redirected to:`
+- Done. You have successfully authenticated Spotify on your device
+
 
 
 
