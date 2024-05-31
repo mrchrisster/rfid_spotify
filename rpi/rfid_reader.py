@@ -19,10 +19,10 @@ logging.basicConfig(
 reader = SimpleMFRC522()
 
 # Constants for Spotify credentials and settings
-CLIENT_ID = '3353adb1a5be45aaa9f60ff88ba8214f'
-CLIENT_SECRET = 'e55d5d3cf939446aae339aef3e257c89'
+CLIENT_ID = '3353ada8214f'
+CLIENT_SECRET = 'e55d5d3ef3e257c89'
 REDIRECT_URI = 'http://localhost:8888/callback'
-DESIRED_DEVICE_NAME = "Squam baby"  # Replace with your desired device name
+DESIRED_DEVICE_NAME = "Squam"  # Replace with your desired device name
 DESIRED_VOLUME = 50  # Set your desired volume level (0-100)
 CACHE_PATH = os.path.join(os.path.expanduser("~"), ".spotify_token_cache")
 LOOKUP_FILE = 'uid_lookup.csv'
