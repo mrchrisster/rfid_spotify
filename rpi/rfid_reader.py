@@ -19,10 +19,10 @@ logging.basicConfig(
 reader = SimpleMFRC522()
 
 # Constants for Spotify credentials and settings
-CLIENT_ID = '3353ada8214f'
-CLIENT_SECRET = 'e55d5d3ef3e257c89'
+CLIENT_ID = '3353adb1a5be45aaa9f60ff88ba8214f'
+CLIENT_SECRET = 'e55d5d3cf939446aae339aef3e257c89'
 REDIRECT_URI = 'http://localhost:8888/callback'
-DESIRED_DEVICE_NAME = "Squam"  # Replace with your desired device name
+DESIRED_DEVICE_NAME = "Squam baby"  # Replace with your desired device name
 DESIRED_VOLUME = 50  # Set your desired volume level (0-100)
 CACHE_PATH = os.path.join(os.path.expanduser("~"), ".spotify_token_cache")
 LOOKUP_FILE = 'uid_lookup.csv'
@@ -46,13 +46,26 @@ def initialize_spotify():
     sp = spotipy.Spotify(auth=token_info['access_token'])
     return sp, sp_oauth, token_info
 
-def refresh_spotify_token(sp, sp_oauth, token_info):
+def refresh_spotify_token(sp_oauth, token_info):
     if sp_oauth.is_token_expired(token_info):
         token_info = sp_oauth.refresh_access_token(token_info['refresh_token'])
         sp = spotipy.Spotify(auth=token_info['access_token'])
-    return sp, token_info
+        return sp, token_info
+    else:
+        sp = spotipy.Spotify(auth=token_info['access_token'])
+        return sp, token_info
 
-def get_track_name(sp, uri):
+def ensure_token(func):
+    def wrapper(*args, **kwargs):
+        sp, sp_oauth, token_info = args[-3:]
+        if sp_oauth.is_token_expired(token_info):
+            sp, token_info = refresh_spotify_token(sp_oauth, token_info)
+            args = args[:-3] + (sp, sp_oauth, token_info)
+        return func(*args, **kwargs)
+    return wrapper
+
+@ensure_token
+def get_track_name(sp, uri, sp_oauth, token_info):
     if uri.startswith('spotify:track'):
         track_info = sp.track(uri)
         return track_info['name']
@@ -91,13 +104,13 @@ def load_lookup(filename=LOOKUP_FILE):
                     lookup[uid] = name
     return lookup
 
-def populate_lookup(mappings, sp, filename=LOOKUP_FILE):
+def populate_lookup(mappings, sp, sp_oauth, token_info, filename=LOOKUP_FILE):
     lookup = {}
     if not os.path.exists(filename):
         with open(filename, mode='w', newline='') as outfile:
             writer = csv.writer(outfile)
             for uid, uri in mappings.items():
-                track_name = get_track_name(sp, uri)
+                track_name = get_track_name(sp, uri, sp_oauth, token_info)
                 lookup[uid] = track_name
                 writer.writerow([uid, track_name])
     else:
@@ -109,7 +122,8 @@ def update_lookup(uid, name, filename=LOOKUP_FILE):
         writer = csv.writer(outfile)
         writer.writerow([uid, name])
 
-def play_content(sp, device_id, uri, track_name):
+@ensure_token
+def play_content(sp, device_id, uri, track_name, sp_oauth, token_info):
     sp.shuffle(False, device_id=device_id)  # Ensure shuffle is off
     if uri.startswith('spotify:track'):
         sp.start_playback(device_id=device_id, uris=[uri])
@@ -125,7 +139,6 @@ def main_loop(reader, mappings, lookup, sp, sp_oauth, token_info, device_id):
 
     while True:
         try:
-            sp, token_info = refresh_spotify_token(sp, sp_oauth, token_info)
             id, text = reader.read()
             uid_str = str(id).strip()
 
@@ -142,16 +155,27 @@ def main_loop(reader, mappings, lookup, sp, sp_oauth, token_info, device_id):
                 if uid_str in mappings:
                     uri = mappings[uid_str]
                     if uid_str not in lookup:
-                        track_name = get_track_name(sp, uri)
+                        sp, token_info = refresh_spotify_token(sp_oauth, token_info)
+                        track_name = get_track_name(sp, uri, sp_oauth, token_info)
                         lookup[uid_str] = track_name
                         update_lookup(uid_str, track_name)
                     else:
                         track_name = lookup[uid_str]
-                    play_content(sp, device_id, uri, track_name)
+                    sp, token_info = refresh_spotify_token(sp_oauth, token_info)
+                    if sp is not None:
+                        play_content(sp, device_id, uri, track_name, sp_oauth, token_info)
+                    else:
+                        print(f"Failed to refresh Spotify token for UID: {uid_str}")
                 else:
                     print(f"No track mapped for UID {uid_str}")
 
             time.sleep(0.1)  # Short sleep to reduce CPU usage
+        except spotipy.exceptions.SpotifyException as e:
+            if e.http_status == 401:
+                sp, token_info = refresh_spotify_token(sp_oauth, token_info)
+            else:
+                print(f"An error occurred in the main loop: {e}")
+                time.sleep(5)  # Delay before restarting the loop
         except Exception as e:
             print(f"An error occurred in the main loop: {e}")
             time.sleep(5)  # Delay before restarting the loop
@@ -168,7 +192,7 @@ def get_device_id(sp, device_name):
 if __name__ == "__main__":
     mappings = load_mappings()
     sp, sp_oauth, token_info = initialize_spotify()
-    lookup = populate_lookup(mappings, sp)
+    lookup = populate_lookup(mappings, sp, sp_oauth, token_info)
 
     # Display the loaded mappings
     print("Loaded RFID to Spotify track mappings:")
