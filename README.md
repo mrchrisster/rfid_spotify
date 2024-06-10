@@ -44,7 +44,7 @@ Software:
     ```
     sudo -s
     apt-get update
-    apt-get install python3-dev python3-pip
+    apt-get install python3-dev python3-pip virtualenv
     virtualenv venv
     source venv/bin/activate
     pip3 install spidev
