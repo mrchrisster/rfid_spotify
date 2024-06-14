@@ -40,7 +40,11 @@ Or simply Download for SPI enabled version:
 Software:
   - Once you have the nanopc up and running, double check with `ls /dev/spi*` that your SPI device is running and active
   - Next we need a special version of wiringpi for the nanopc t4. Install these two versions: [main install](https://wiki.friendlyelec.com/wiki/index.php/WiringPi_for_RK3399) and [python wrapper](https://wiki.friendlyelec.com/wiki/index.php/WiringPi-Python_for_RK3399)
-  - The installation of python-wrapper will fail most likely. Try `unzip wiringpi-2.44.4-py3.6-linux-aarch64.egg -d wiringpi_extracted` and `cp -r ~/setuptools-33.1.1/wiringpi_extracted/* /root/new_venv/lib/python3.8/site-packages/` to install
+  - The installation of python-wrapper will fail most likely. Try this:
+  - `sudo apt-get install build-essential python3-dev python3-setuptools python3-wheel`
+  -`sudo pip3 install --upgrade pip`
+  - `pip3 cache purge`
+  - `
   - Install the following libraries and modules:
     ```
     sudo -s
