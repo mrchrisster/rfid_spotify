@@ -1,5 +1,18 @@
 # Alexa-Spotify Box
 
+
+Wiring Guide:
+RC522 Pin	ESP32 Pin Label	Description
+SDA (SS)	D5	Slave Select (Chip Select)
+SCK	D18	Serial Clock
+MOSI	D23	Master Out Slave In
+MISO	D19	Master In Slave Out
+IRQ	Not connected	Interrupt Request (optional)
+GND	GND	Ground
+RST	D4	Reset
+VCC	3.3V	Power supply (3.3V preferred)
+
+
 ## Get refresh token
 - Go to spotify dev page https://developer.spotify.com/
 - Use getrefreshtoken.py to obtain refresh token
