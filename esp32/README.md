@@ -2,15 +2,23 @@
 
 
 Wiring Guide:
-RC522 Pin	ESP32 Pin Label	Description
-SDA (SS)	D5	Slave Select (Chip Select)
-SCK	D18	Serial Clock
-MOSI	D23	Master Out Slave In
-MISO	D19	Master In Slave Out
-IRQ	Not connected	Interrupt Request (optional)
-GND	GND	Ground
-RST	D4	Reset
-VCC	3.3V	Power supply (3.3V preferred)
+## RFID-RC522 to ESP32 Wiring
+
+| RFID-RC522 Pin | ESP32 Pin | Description          |
+|----------------|-----------|----------------------|
+| **SDA (SS)**   | D5        | Slave Select         |
+| **SCK**        | D18       | Serial Clock         |
+| **MOSI**       | D23       | Master Out Slave In  |
+| **MISO**       | D19       | Master In Slave Out  |
+| **IRQ**        | Not Connected | Interrupt Request (optional) |
+| **GND**        | GND       | Ground               |
+| **RST**        | D4        | Reset Pin            |
+| **3.3V**       | 3V3       | Power (3.3V)         |
+
+### Notes:
+- Ensure the RFID-RC522 module is powered with 3.3V to avoid damaging the ESP32.
+- The `IRQ` pin is not required for basic operation and can be left unconnected.
+
 
 
 ## Get refresh token
