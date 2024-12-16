@@ -1,6 +1,19 @@
-# Magical Alexa-Spotify-CD Box
+# Alexa-Spotify Box
 
+## Get refresh token
+- Go to spotify dev page https://developer.spotify.com/
+- Use getrefreshtoken.py to obtain refresh token
 
+## Setup
+- Put your data in settings.h
+
+## RFID Writer
+- Flash rfid writer and encode spotify URI to card
+
+## Final Setup
+- Flash script and try
+
+## Original Post
 For Christmas, I signed myself up for the "Creative Engineering with Mark Rober". As part of the class we have to build something with an Arduino. Here is my project. 
 
 For my final project in the Creative Engineering with Mark Rober class, I submit to you my magic Alexa-Spotify-CD box. 
