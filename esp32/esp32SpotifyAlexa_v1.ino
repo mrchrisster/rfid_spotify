@@ -6,136 +6,219 @@
 #include "MFRC522.h"
 #include "settings.h"
 
-#define RST_PIN 4  // Configurable, see typical pin layout above
-#define SS_PIN 5   // Configurable, see typical pin layout above
+// NFC reader pins
+#define RST_PIN 4
+#define SS_PIN 5
+MFRC522 mfrc522(SS_PIN, RST_PIN); // Create MFRC522 instance
 
-MFRC522 mfrc522(SS_PIN, RST_PIN);  // Create MFRC522 instance
-
-// Debug Mode
 bool debugMode = false;
-SpotifyClient spotify = SpotifyClient(clientId, clientSecret, deviceName, refreshToken);
+bool reconnecting = false;
+bool wasWifiDisconnected = false;
+
+SpotifyClient spotify(clientId, clientSecret, deviceName, refreshToken);
 
 void setup() {
-  Serial.begin(115200);
-  Serial.println("Setup started");
+    Serial.begin(115200);
+    Serial.println("[Main] Setup started");
 
-  connectWifi();
+    connectWifi();
 
-  // Init SPI bus and MFRC522 for NFC reader
-  SPI.begin();
-  mfrc522.PCD_Init();
+    // Initialize SPI bus and NFC reader
+    SPI.begin();
+    mfrc522.PCD_Init();
 
-  // Refresh Spotify Auth token and Device ID (only if not in debug mode)
-  if (!debugMode) {
-    spotify.FetchToken();
-    spotify.GetDevices();
-  }
+    if (!debugMode) {
+        Serial.println("[Main] Ensuring token fresh and fetching devices...");
+        if (!spotify.EnsureTokenFresh()) {
+            Serial.println("[Main] Initial token fetch failed. Please check credentials.");
+        } else {
+            spotify.GetDevices();
+        }
+    }
 }
 
 void loop() {
+    ensureWifiConnected();
+
+    // If Wi-Fi reconnected after a disconnect, reset Spotify state
+    if (WiFi.status() == WL_CONNECTED && wasWifiDisconnected) {
+        Serial.println("[Main] Wi-Fi reconnected. Resetting Spotify client...");
+        spotify.ResetState();
+        wasWifiDisconnected = false;
+    }
+
+    // If token is nearing expiry or invalid, ensure it's fresh
+    if (!debugMode && !spotify.IsTokenValid()) {
+        Serial.println("[Main] Token invalid or expired. Ensuring fresh token...");
+        if (!spotify.EnsureTokenFresh()) {
+            Serial.println("[Main] Failed to refresh token. Requests may fail.");
+        }
+    }
+
+    // NFC tag detection and processing (unchanged)
     if (mfrc522.PICC_IsNewCardPresent()) {
-        Serial.println("NFC tag present");
+        Serial.println("[Main] NFC tag detected");
         readNFCTag();
     }
 }
 
+void connectWifi() {
+    if (debugMode) {
+        Serial.println("[Main][DEBUG] Skipping Wi-Fi connection in debug mode.");
+        return;
+    }
+
+    Serial.println("[Main] Connecting to Wi-Fi...");
+    WiFi.begin(ssid, pass);
+
+    unsigned long startAttemptTime = millis();
+    const unsigned long timeout = 30000; // 30 seconds timeout
+
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < timeout) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n[Main] Connected to Wi-Fi.");
+        Serial.print("[Main] IP Address: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\n[Main] Failed to connect to Wi-Fi.");
+    }
+}
+
+void ensureWifiConnected() {
+    static unsigned long lastReconnectAttempt = 0;
+    const unsigned long reconnectInterval = 5000; // Retry every 5 seconds
+
+    if (WiFi.status() != WL_CONNECTED && !reconnecting) {
+        if (millis() - lastReconnectAttempt > reconnectInterval) {
+            reconnecting = true;
+            Serial.println("[Main] Wi-Fi disconnected. Attempting to reconnect...");
+            WiFi.disconnect(); // Reset connection
+            WiFi.begin(ssid, pass);
+            lastReconnectAttempt = millis();
+        }
+    } else if (WiFi.status() == WL_CONNECTED) {
+        reconnecting = false;
+    } else {
+        wasWifiDisconnected = true;
+    }
+}
 
 void logError(String message, int httpCode) {
-  Serial.println("Error: " + message + " HTTP Code: " + String(httpCode));
+    Serial.println("[Error] " + message + " HTTP Code: " + String(httpCode));
 }
 
 void readNFCTag() {
-  if (mfrc522.PICC_ReadCardSerial()) {
-    Serial.println("Card detected. Reading data...");
+    if (mfrc522.PICC_ReadCardSerial()) {
+        Serial.println("Card detected. Reading data...");
+        
+        // Read the content from the NFC card
+        String context_uri = readFromCard();
 
-    String context_uri = readFromCard();
-    mfrc522.PICC_HaltA();  // Halt the card
-    mfrc522.PCD_StopCrypto1(); // Stop encryption on the card
+        // Halt and reset the card state
+        mfrc522.PICC_HaltA();  
+        mfrc522.PCD_StopCrypto1(); 
+        delay(50); // Ensure proper reset timing
 
-    if (!context_uri.isEmpty()) {
-      Serial.println("Read NFC tag: " + context_uri);
+        if (!context_uri.isEmpty()) {
+            Serial.println("Read NFC tag: " + context_uri);
 
-      // Determine the type and play the appropriate content
-      if (context_uri.startsWith("spotify:artist:")) {
-        playRandomAlbumFromArtist(context_uri);
-      } else {
-        playSpotifyUri(context_uri); // Default for anything else
-      }
+            // Determine the type and play the appropriate content
+            if (context_uri.startsWith("spotify:artist:")) {
+                playRandomAlbumFromArtist(context_uri);
+            } else {
+                playSpotifyUri(context_uri); // Default for anything else
+            }
+        } else {
+            Serial.println("Failed to read data from the card.");
+        }
     } else {
-      Serial.println("Failed to read data from the card.");
+        Serial.println("Failed to read card serial.");
     }
-  } else {
-    Serial.println("Failed to read card serial.");
-  }
 }
 
 String readFromCard() {
-  MFRC522::MIFARE_Key key;
-  for (byte i = 0; i < 6; i++) {
-    key.keyByte[i] = 0xFF; // Default key
-  }
-
-  byte block = 4;  // Start block for reading
-  String result = "";
-  byte buffer[18];
-  byte size = sizeof(buffer);
-  bool hasData = false; // Flag to check if meaningful data is found
-
-  while (block < 64) {  // Loop through data blocks
-    if (block == 7 || block == 11) {
-      block++; // Skip trailer blocks
-      continue;
+    MFRC522::MIFARE_Key key;
+    for (byte i = 0; i < 6; i++) {
+        key.keyByte[i] = 0xFF; // Default key
     }
 
-    if (authenticateBlock(block, &key) != MFRC522::STATUS_OK) {
-      Serial.print("Authentication failed at block ");
-      Serial.println(block);
-      break;
+    byte block = 4; // Start block for reading
+    String result = "";
+    byte buffer[18];
+    byte size = sizeof(buffer);
+    bool hasData = false;
+
+    while (block < 64) {
+        if (block == 7 || block == 11) { // Skip trailer blocks
+            block++;
+            continue;
+        }
+
+        Serial.print("[Main] Authenticating block ");
+        Serial.println(block);
+
+        if (authenticateBlock(block, &key) != MFRC522::STATUS_OK) {
+            Serial.print("[Main] Authentication failed at block ");
+            Serial.println(block);
+            break;
+        }
+
+        if (mfrc522.MIFARE_Read(block, buffer, &size) != MFRC522::STATUS_OK) {
+            Serial.print("[Main] Read failed at block ");
+            Serial.println(block);
+            break;
+        }
+
+        Serial.print("[Main] Data in block ");
+        Serial.print(block);
+        Serial.print(": ");
+        for (byte i = 0; i < size; i++) {
+            Serial.print((char)buffer[i]);
+        }
+        Serial.println();
+
+        // Append non-zero data
+        for (byte i = 0; i < 16; i++) {
+            if (buffer[i] != 0) {
+                hasData = true;
+                result += (char)buffer[i];
+            }
+        }
+
+        if (!hasData) {
+            break;
+        }
+
+        hasData = false; // Reset flag
+        block++;
     }
 
-    if (mfrc522.MIFARE_Read(block, buffer, &size) != MFRC522::STATUS_OK) {
-      Serial.print("Read failed at block ");
-      Serial.println(block);
-      break;
+    if (!result.startsWith("spotify:")) {
+        result = "spotify:" + result;
     }
 
-    // Check for non-zero data
-    for (byte i = 0; i < 16; i++) {
-      if (buffer[i] != 0) {
-        hasData = true;
-        result += (char)buffer[i]; // Append valid characters
-      }
-    }
-
-    if (!hasData) {
-      break;
-    }
-
-    hasData = false; // Reset flag for next block
-    block++;
-  }
-
-  if (!result.startsWith("spotify:")) {
-    result = "spotify:" + result;
-  }
-
-  return result;
+    return result;
 }
 
+
 MFRC522::StatusCode authenticateBlock(byte block, MFRC522::MIFARE_Key *key) {
-  MFRC522::StatusCode status;
-  for (int retries = 0; retries < 3; retries++) { // Retry up to 3 times
-    status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, key, &(mfrc522.uid));
-    if (status == MFRC522::STATUS_OK) break;
-  }
-  return status;
+    MFRC522::StatusCode status;
+    for (int retries = 0; retries < 3; retries++) {
+        status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, key, &(mfrc522.uid));
+        if (status == MFRC522::STATUS_OK) break;
+    }
+    return status;
 }
 
 void playSpotifyUri(String contextUri) {
-    Serial.println("Attempting to play Spotify URI: " + contextUri);
+    Serial.println("[Main] Attempting to play Spotify URI: " + contextUri);
 
     if (debugMode) {
-        Serial.println("[DEBUG] Would attempt to play: " + contextUri);
+        Serial.println("[Main][DEBUG] Simulated playback for URI: " + contextUri);
         return;
     }
 
@@ -144,116 +227,66 @@ void playSpotifyUri(String contextUri) {
     const int maxRetries = 3;
 
     while (retryCount < maxRetries) {
-        Serial.print("Retry count: ");
-        Serial.println(retryCount);
+        Serial.print("[Main] Playback attempt: ");
+        Serial.println(retryCount + 1);
 
         int code = spotify.Play(contextUri);
 
         if (code == 200 || code == 204) {
-            Serial.println("Playback started successfully. Retry count: " + String(retryCount));
-            break; // Exit the loop after successful playback
-        } else if (code == 401) {
-            Serial.println("Access token expired. Refreshing token...");
-            spotify.FetchToken(); // Refresh the access token
-        } else if (code == 502) {
-            Serial.println("Bad gateway. Retrying...");
+            Serial.println("[Main] Playback started successfully.");
+            break;
+        } else if (code == 401 || code == 404) {
+            Serial.println("[Main] Access token expired or invalid device ID. Resetting state...");
+            spotify.ResetState();
         } else {
-            logError("Unexpected error occurred.", code);
-            break; // Exit on other errors
+            logError("Unexpected playback error.", code);
         }
 
         retryCount++;
-        delay(2000); // Wait before retrying
-    }
-
-    if (retryCount >= maxRetries) {
-        Serial.println("Max retries reached. Unable to play the URI.");
+        delay(2000);
     }
 }
 
-
-
 void disableShuffle() {
-    String url = "https://api.spotify.com/v1/me/player/shuffle?state=false";
-    HttpResult shuffleResult = spotify.CallAPI("PUT", url, "{}"); // Pass an empty JSON body
+    HttpResult shuffleResult = spotify.CallAPI("PUT", "https://api.spotify.com/v1/me/player/shuffle?state=false", "{}");
 
     if (shuffleResult.httpCode == 200 || shuffleResult.httpCode == 204) {
-        Serial.println("Shuffle disabled successfully.");
+        Serial.println("[Main] Shuffle disabled successfully.");
     } else {
         logError("Failed to disable shuffle.", shuffleResult.httpCode);
     }
 }
 
-
-void refreshTokenAndRetry(String context_uri) {
-  Serial.println("Error: Auth token expired. Refreshing token...");
-  spotify.FetchToken();
-  int retryCode = spotify.Play(context_uri);
-  if (retryCode == 200 || retryCode == 204) {
-    Serial.println("Playback started successfully after refreshing token.");
-  } else {
-    logError("Failed to start playback after refreshing token.", retryCode);
-  }
-}
-
 void playRandomAlbumFromArtist(String artistUri) {
-  Serial.println("Fetching albums for artist: " + artistUri);
+    Serial.println("[Main] Fetching albums for artist: " + artistUri);
 
-  if (debugMode) {
-    Serial.println("[DEBUG] Would fetch albums for artist URI: " + artistUri);
-    return;
-  }
-
-  String artistId = artistUri.substring(15);
-  String url = "https://api.spotify.com/v1/artists/" + artistId + "/albums?include_groups=album";
-  HttpResult result = spotify.CallAPI("GET", url, "");
-
-  if (result.httpCode == 200 || result.httpCode == 204) {
-    DynamicJsonDocument doc(8192);
-    DeserializationError error = deserializeJson(doc, result.payload);
-
-    if (error) {
-      logError("JSON parsing failed.", result.httpCode);
-      return;
+    if (debugMode) {
+        Serial.println("[Main][DEBUG] Simulated album fetch for artist URI: " + artistUri);
+        return;
     }
 
-    JsonArray albums = doc["items"].as<JsonArray>();
-    std::vector<String> albumUris;
+    String artistId = artistUri.substring(15);
+    HttpResult result = spotify.CallAPI("GET", "https://api.spotify.com/v1/artists/" + artistId + "/albums?include_groups=album", "");
 
-    for (JsonObject album : albums) {
-      String uri = album["uri"].as<String>();
-      albumUris.push_back(uri);
-    }
+    if (result.httpCode == 200) {
+        DynamicJsonDocument doc(8192);
+        DeserializationError error = deserializeJson(doc, result.payload);
 
-    if (!albumUris.empty()) {
-      int randomIndex = random(0, albumUris.size());
-      String randomAlbumUri = albumUris[randomIndex];
-      Serial.println("Selected Random Album URI: " + randomAlbumUri);
-      playSpotifyUri(randomAlbumUri);
+        if (error) {
+            logError("JSON parsing failed.", result.httpCode);
+            return;
+        }
+
+        JsonArray albums = doc["items"].as<JsonArray>();
+        if (!albums.isNull() && albums.size() > 0) {
+            int randomIndex = random(0, albums.size());
+            String randomAlbumUri = albums[randomIndex]["uri"].as<String>();
+            Serial.println("[Main] Selected album URI: " + randomAlbumUri);
+            playSpotifyUri(randomAlbumUri);
+        } else {
+            Serial.println("[Main] No albums found for artist.");
+        }
     } else {
-      Serial.println("No albums found for this artist.");
+        logError("Failed to fetch albums.", result.httpCode);
     }
-  } else {
-    logError("Failed to fetch albums.", result.httpCode);
-  }
-}
-
-void connectWifi() {
-  if (debugMode) {
-    Serial.println("[DEBUG] WiFi connection skipped in debug mode.");
-    return;
-  }
-
-  WiFi.begin(ssid, pass);
-  Serial.println("");
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.print("Connected to ");
-  Serial.println(ssid);
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
 }

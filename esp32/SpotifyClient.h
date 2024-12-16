@@ -11,29 +11,38 @@ class SpotifyClient {
 public:
     SpotifyClient(String clientId, String clientSecret, String deviceName, String refreshToken);
 
-    void FetchToken();
-    int Play(String context_uri);
-    int Shuffle();
-    int Next();
-    String GetDevices();
-    HttpResult CallAPI(String method, String url, String body);
-    void ResetState();
-    bool IsTokenValid() { return tokenValid; } // Getter for tokenValid
+    void FetchToken();                               // Fetches a new access token
+    int Play(String context_uri);                    // Starts playback of a given context
+    int Shuffle();                                   // Enables shuffle on the active device
+    int Next();                                      // Skips to the next track
+    String GetDevices();                             // Fetches a list of devices and sets the active device
+    HttpResult CallAPI(String method, String url, String body); // Generic API call method
+    void ResetState();                               // Resets token and device state
+    bool IsTokenValid() { return tokenValid; }       // Getter for token validity
+    bool IsTokenExpired();                           // Checks if the token is expired
+    unsigned long GetTokenRefreshInterval() const { return tokenRefreshInterval; } // Getter for token refresh interval
+	bool EnsureTokenFresh();
+
 
 private:
     WiFiClientSecure client;
-    String clientId;
-    String clientSecret;
-    String redirectUri;
-    String accessToken;
-    String refreshToken;
-    String deviceId;
-    String deviceName;
+    String clientId;              // Spotify Client ID
+    String clientSecret;          // Spotify Client Secret
+    String accessToken;           // Spotify Access Token
+    String refreshToken;          // Spotify Refresh Token
+    String deviceId;              // Active Spotify Device ID
+    String deviceName;            // Name of the device to control
 
-    String ParseJson(String key, String json);
-    String GetDeviceId(String json);
+    String ParseJson(String key, String json);       // Extracts a value from JSON by key
+    String GetDeviceId(String json);                // Extracts device ID from the devices JSON
+    String ParseDeviceId(String json);              // Parses and sets the active device ID
 
-    bool tokenValid = false; // Track whether the token is valid
+    bool tokenValid = false;        // Tracks if the access token is valid
+    unsigned long tokenRefreshInterval = 3600000; // Token expiration time in milliseconds
+    unsigned long lastTokenRefresh = 0;          // Timestamp of the last token refresh
+    unsigned long tokenExpiresIn = 0;            // Token expiration duration in milliseconds
+
+    int MakeAPIRequest(String method, String url, String body); // Handles API requests
 
     // Root certificate for spotify.com
     const char* digicert_root_ca = \
