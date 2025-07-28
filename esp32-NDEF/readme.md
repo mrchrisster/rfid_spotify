@@ -1,0 +1,14 @@
+VCC → 3.3V
+
+GND → GND
+
+RST → GPIO 10
+
+SDA (SS) → GPIO 11
+
+MOSI → GPIO 7
+
+MISO → GPIO 6
+
+SCK → GPIO 1
+
