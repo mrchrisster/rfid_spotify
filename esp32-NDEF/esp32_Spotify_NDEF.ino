@@ -175,7 +175,6 @@ void playRandomAlbumFromArtist(const String& artistUri) {
     LOG("[Main] New artist detected. Building shuffled index for " + artistId);
     albumPlaylistIndices.clear();
 
-    // Step 1: Get the total count of albums from the API
     String countUrl = "https://api.spotify.com/v1/artists/" + artistId + "/albums?include_groups=album,single&limit=1";
     HttpResult countResult = spotify.CallAPI("GET", countUrl, "");
     if (countResult.httpCode != 200) {
@@ -191,23 +190,19 @@ void playRandomAlbumFromArtist(const String& artistUri) {
       return;
     }
 
-    // Step 2: Determine the size and range of our playlist
     int playlistSize = totalAlbums;
-    int startOffset = 0; // The index to start our list from
+    int startOffset = 0;
 
-    if (artistId == "1l6d0RIxTL3JytlLGvWzYe" && totalAlbums > 60) {
+    if ((artistId == "1l6d0RIxTL3JytlLGvWzYe" || artistId == "3t2iKODSDyzoDJw7AsD99u") && totalAlbums > 60) {
       LOG("[Main] Special artist: Creating playlist from the 60 oldest albums.");
       playlistSize = 60;
-      // CORRECTED: Calculate the starting index of the oldest albums
       startOffset = totalAlbums - 60;
     } else {
       LOG("[Main] Building playlist with all " + String(playlistSize) + " album indices.");
     }
 
-    // Step 3: Create and shuffle the list of indices
     albumPlaylistIndices.resize(playlistSize);
     for (int i = 0; i < playlistSize; i++) {
-      // Fill the list with the correct range of indices (e.g., 169, 170, 171...)
       albumPlaylistIndices[i] = startOffset + i;
     }
     
@@ -222,7 +217,6 @@ void playRandomAlbumFromArtist(const String& artistUri) {
     LOG("[Main] Shuffled index created successfully.");
   }
 
-  // Check if we've played everything. If so, reshuffle the index.
   if (playlistIndex >= albumPlaylistIndices.size()) {
     LOG("[Main] Playlist exhausted. Reshuffling index...");
     randomSeed(micros());
@@ -233,34 +227,68 @@ void playRandomAlbumFromArtist(const String& artistUri) {
     playlistIndex = 0;
   }
 
-  // Step 4: Get the next album index from our shuffled list and fetch ONLY that album
-  int randomOffset = albumPlaylistIndices[playlistIndex];
-  playlistIndex++;
-  
-  LOG("[Main] Playing album at index #" + String(randomOffset) + " (track " + String(playlistIndex) + " of " + String(albumPlaylistIndices.size()) + ")");
+  String albumUri = "";
+  String albumName = "";
+  bool isSpecialArtist = (artistId == "1l6d0RIxTL3JytlLGvWzYe" || artistId == "3t2iKODSDyzoDJw7AsD99u");
 
-  String albumUrl = "https://api.spotify.com/v1/artists/" + artistId + "/albums?include_groups=album,single&limit=1&offset=" + String(randomOffset);
-  HttpResult albumResult = spotify.CallAPI("GET", albumUrl, "");
-  if (albumResult.httpCode != 200) {
-    logError("fetch random album", albumResult.httpCode);
-    return;
-  }
+  if (isSpecialArtist) {
+    LOG("[Main] Special artist: Searching for an album with 'Folge' in the title...");
+    const int MAX_RETRIES = 15;
+    for (int retry = 0; retry < MAX_RETRIES; retry++) {
+      if (playlistIndex >= albumPlaylistIndices.size()) {
+          LOG("[Main] Playlist exhausted during search. Reshuffling...");
+          randomSeed(micros());
+          for (int i = albumPlaylistIndices.size() - 1; i > 0; --i) { int j = random(0, i + 1); std::swap(albumPlaylistIndices[i], albumPlaylistIndices[j]); }
+          playlistIndex = 0;
+      }
+      
+      int randomOffset = albumPlaylistIndices[playlistIndex];
+      playlistIndex++;
+      
+      LOG("[Main] Attempt #" + String(retry + 1) + ": Checking album at index " + String(randomOffset));
+      String albumUrl = "https://api.spotify.com/v1/artists/" + artistId + "/albums?include_groups=album,single&limit=1&offset=" + String(randomOffset);
+      HttpResult albumResult = spotify.CallAPI("GET", albumUrl, "");
 
-  // This JSON is for a single album, so it's very small and safe to parse.
-  DynamicJsonDocument albumDoc(2048);
-  DeserializationError error = deserializeJson(albumDoc, albumResult.payload);
-  if (error) {
-    LOG("[Error] Failed to parse single album JSON: " + String(error.c_str()));
-    return;
+      if (albumResult.httpCode == 200) {
+          DynamicJsonDocument albumDoc(2048);
+          deserializeJson(albumDoc, albumResult.payload);
+          
+          // FIX #2: Explicitly cast the JSON value to a String
+          String tempAlbumName = albumDoc["items"][0]["name"].as<String>();
+          
+          // FIX #1: Use two steps for toLowerCase() and indexOf()
+          String checkName = tempAlbumName;
+          checkName.toLowerCase();
+          if (checkName.indexOf("folge") != -1) {
+              LOG("[Main] Match found: " + tempAlbumName);
+              albumName = tempAlbumName;
+              albumUri = albumDoc["items"][0]["uri"].as<String>();
+              break; 
+          } else {
+              albumUri = ""; 
+          }
+      }
+    }
+  } else {
+    int randomOffset = albumPlaylistIndices[playlistIndex];
+    playlistIndex++;
+    
+    LOG("[Main] Playing album at index #" + String(randomOffset) + " (track " + String(playlistIndex) + " of " + String(albumPlaylistIndices.size()) + ")");
+    String albumUrl = "https://api.spotify.com/v1/artists/" + artistId + "/albums?include_groups=album,single&limit=1&offset=" + String(randomOffset);
+    HttpResult albumResult = spotify.CallAPI("GET", albumUrl, "");
+    if (albumResult.httpCode == 200) {
+      DynamicJsonDocument albumDoc(2048);
+      deserializeJson(albumDoc, albumResult.payload);
+      // FIX #2: Explicitly cast the JSON value to a String
+      albumUri = albumDoc["items"][0]["uri"].as<String>();
+      albumName = albumDoc["items"][0]["name"].as<String>();
+    }
   }
-  
-  String albumUri = albumDoc["items"][0]["uri"];
-  String albumName = albumDoc["items"][0]["name"];
 
   if (albumUri.length() > 0) {
     LOG("[Main] Now playing: " + albumName);
     playSpotifyUri(albumUri);
   } else {
-    LOG("[Main] Failed to extract URI from single album data.");
+    LOG("[Main] Failed to find a matching album for this tap.");
   }
 }
