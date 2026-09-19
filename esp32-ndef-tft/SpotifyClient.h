@@ -2,6 +2,8 @@
 #include <Arduino.h>
 #include <WiFiClientSecure.h>
 
+void logMessage(const String& msg);
+
 struct HttpResult {
     int httpCode;
     String payload;
@@ -9,14 +11,19 @@ struct HttpResult {
 
 class SpotifyClient {
 public:
+    typedef void (*RefreshTokenCallback)(const String& newRefreshToken);
+
     SpotifyClient(String clientId, String clientSecret, String deviceName, String refreshToken);
 
+    void SetRefreshTokenCallback(RefreshTokenCallback callback);
     void FetchToken();                               // Fetches a new access token
     int Play(String context_uri);                    // Starts playback of a given context
     int Shuffle();                                   // Enables shuffle on the active device
     int Next();                                      // Skips to the next track
     String GetDevices();                             // Fetches a list of devices and sets the active device
     HttpResult CallAPI(String method, String url, String body); // Generic API call method
+    void SetRefreshToken(String newRefreshToken);
+    String GetRefreshToken() const { return refreshToken; }
     void ResetState();                               // Resets token and device state
     bool IsTokenValid() { return tokenValid; }       // Getter for token validity
     bool IsTokenExpired();                           // Checks if the token is expired
@@ -24,9 +31,8 @@ public:
 	bool EnsureTokenFresh();
     int DownloadFile(String url, uint8_t* buffer, size_t maxSize); // New function
 
-
-
 private:
+    RefreshTokenCallback onTokenRotated = nullptr;
     WiFiClientSecure client;
     String clientId;              // Spotify Client ID
     String clientSecret;          // Spotify Client Secret
