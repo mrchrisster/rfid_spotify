@@ -1,1107 +1,621 @@
 #include <Arduino.h>
+#include "DeviceConfig.h"
+#if PLAYER_HAS_DISPLAY
 #include <Adafruit_ILI9341.h>
 #include <JPEGDecoder.h>
-#include <HTTPClient.h>
+#endif
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <SPI.h>
-#include <vector>
-#include <deque>
-#include <algorithm>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
-#include "MFRC522.h"
-#include "NfcAdapter.h"      // Added for NDEF support
+#include <esp_system.h>
+#include <esp_heap_caps.h>
+#include <atomic>
+#include <vector>
+#include "RfidReader.h"
+#include "RfidPresence.h"
+#include "RfidRecovery.h"
+#include "Reliability.h"
 #include "SpotifyClient.h"
+#include "DeviceAuth.h"
+#include "DeviceIdentity.h"
 #include "settings.h"
 
-#define MAX_JPEG   (64 * 1024)
-static uint8_t jpgBuf[MAX_JPEG];
-static size_t lastJpgCount = 0;
-
+constexpr uint8_t TFT_CS = 15, TFT_DC = 2, TFT_RST = 22, SS_PIN = 5, RST_PIN = 4;
+constexpr size_t MAX_JPEG = 64 * 1024;
+const char firmwareBuild[] = __DATE__ " " __TIME__;
+#if PLAYER_HAS_DISPLAY
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+#endif
+MFRC522 reader(SS_PIN, MFRC522::UNUSED_PIN);
+RfidPresence cardPresence;
+SpotifyClient spotify(clientId, clientSecret, deviceName, refreshToken);
 Preferences preferences;
 WebServer webServer(80);
+String adminPassword;
 
-// --- Screen Definitions ---
-#define TFT_CS    15
-#define TFT_DC     2
-#define TFT_RST   22
-Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
-static uint32_t lastScreenActivityMillis = 0;
+// Queues transfer POD values or explicitly owned buffers, never Arduino String objects.
+enum class Command : uint8_t { Play, Next, Toggle, VolumeUp, VolumeDown, Devices, Select, Token, Refresh, Status };
+struct Job { Command command; uint32_t id = 0; uint8_t attempt = 0; char value[1025] = {}; char name[128] = {}; };
+struct Result {
+  Command command; uint32_t id; int code;
+  bool tokenValid, revoked, unsaved; uint32_t retryMs;
+  char name[128], device[96];
+  char* payload = nullptr;
+  uint8_t* image = nullptr; size_t imageSize = 0;
+};
+enum class DisplayAction : uint8_t { Image, Cached, Clear, Info, Reset };
+struct DisplayJob { DisplayAction action; uint8_t* image = nullptr; size_t size = 0; };
+struct LogLine { char text[224]; };
+QueueHandle_t jobs, results, displayJobs, logs;
+std::atomic<uint32_t> nextJobId{1}, scans{0}, readFailures{0}, recoveries{0}, maxPollGap{0}, lastPoll{0}, rfidVersion{0}, droppedLogs{0};
+std::atomic<bool> rfidOk{false};
+TaskHandle_t networkTaskHandle, hardwareTaskHandle;
+String logHistory[48]; size_t logHead = 0, logCount = 0;
+String devicesJson = "{\"devices\":[]}";
+struct Status { bool tokenValid = false, revoked = false, unsaved = false; uint32_t retryMs = 0, at = 0; String name, device; } status;
+struct JobStatus { uint32_t id = 0; int code = 202; } jobStatus[8];
 
-// --- Log-history for Telnet replay & Web console ---
-static const size_t MAX_LOG_HISTORY = 100;
-std::deque<String> logHistory;
-WiFiServer telnetServer(23);
-WiFiClient telnetClient;
-void logMessage(const String& msg) { logHistory.push_back(msg); if (logHistory.size() > MAX_LOG_HISTORY) logHistory.pop_front(); Serial.println(msg); if (telnetClient && telnetClient.connected()) { telnetClient.println(msg); } }
-#define LOG(x) logMessage(x)
+const char* resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "power-on/chip reset";
+    case ESP_RST_EXT: return "external reset";
+    case ESP_RST_SW: return "software restart";
+    case ESP_RST_PANIC: return "panic/exception";
+    case ESP_RST_INT_WDT: return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "SDIO reset";
+    case ESP_RST_USB: return "USB reset";
+    case ESP_RST_JTAG: return "JTAG reset";
+    case ESP_RST_EFUSE: return "eFuse error";
+    case ESP_RST_PWR_GLITCH: return "power glitch";
+    case ESP_RST_CPU_LOCKUP: return "CPU lockup";
+    default: return "unknown";
+  }
+}
 
-// --- NFC reader (using the correct pins for your device) ---
-#define RST_PIN 4
-#define SS_PIN  5
-MFRC522 mfrc522(SS_PIN, RST_PIN);
-NfcAdapter nfc = NfcAdapter(&mfrc522); // NDEF adapter object
+void logMessage(const String& message) {
+  LogLine line{};
+  snprintf(line.text, sizeof(line.text), "[%lu ms] %s", (unsigned long)millis(), message.c_str());
+  if (!logs || xQueueSend(logs, &line, 0) != pdTRUE) ++droppedLogs;
+}
+bool saveToken(const String& token, bool pkce) {
+  // One NVS record commits token + grant type together, including after refresh rotation.
+  JsonDocument doc; doc["token"] = token; doc["pkce"] = pkce;
+  String data; serializeJson(doc, data);
+  return preferences.putString("auth_v2", data) == data.length();
+}
+bool ok(int code) { return code == 200 || code == 204; }
+void rememberJob(uint32_t id, int code) { if (id) jobStatus[id % 8] = {id, code}; }
+bool submit(Job& job) {
+  job.id = nextJobId.fetch_add(1);
+  bool sent = xQueueSend(jobs, &job, 0) == pdTRUE;
+  if (!sent) logMessage("[Queue] Busy; command rejected");
+  return sent;
+}
+void publish(const Job& job, int code, const String& payload = "", uint8_t* image = nullptr, size_t imageSize = 0) {
+  Result result{};
+  result.command = job.command; result.id = job.id; result.code = code;
+  result.unsaved = spotify.HasUnsavedToken(); result.tokenValid = spotify.IsTokenValid(); result.revoked = spotify.IsRevoked(); result.retryMs = spotify.RetryInMs();
+  strlcpy(result.name, spotify.DeviceName().c_str(), sizeof(result.name));
+  strlcpy(result.device, spotify.DeviceId().c_str(), sizeof(result.device));
+  if (!payload.isEmpty()) result.payload = strdup(payload.c_str());
+  result.image = image; result.imageSize = imageSize;
+  if (xQueueSend(results, &result, portMAX_DELAY) != pdTRUE) {
+    free(result.payload); free(image); logMessage("[Queue] Result dropped; inspect device status");
+  }
+}
 
-bool checkAndRecoverMFRC522(bool forceReset = false) {
-  // Deselect TFT CS before MFRC522 SPI transaction
-  digitalWrite(TFT_CS, HIGH);
+// Spotify state/NVS writes belong to this task. TLS identity uses a separate
+// namespace, owned exclusively by the Arduino task.
+int playerState(JsonDocument& doc) {
+  if (spotify.DeviceId().isEmpty() && spotify.GetDevices().isEmpty()) return 404;
+  HttpResult response = spotify.CallAPI("GET", "https://api.spotify.com/v1/me/player");
+  if (response.httpCode != 200) return response.httpCode == 204 ? 404 : response.httpCode;
+  if (deserializeJson(doc, response.payload)) return 502;
+  if (doc["device"]["id"] != spotify.DeviceId() || doc["device"]["is_restricted"].as<bool>()) return 409;
+  return 200;
+}
+int control(Command command) {
+  if (command == Command::Next) return spotify.Next();
+  JsonDocument state;
+  int code = playerState(state); if (code != 200) return code;
+  String base = "https://api.spotify.com/v1/me/player/";
+  if (command == Command::Toggle) {
+    return spotify.CallAPI("PUT", base + (state["is_playing"].as<bool>() ? "pause" : "play") + "?device_id=" + spotify.DeviceId()).httpCode;
+  }
+  if (!state["device"]["supports_volume"].as<bool>() || !state["device"]["volume_percent"].is<int>()) return 403;
+  int volume = constrain(state["device"]["volume_percent"].as<int>() + (command == Command::VolumeUp ? 10 : -10), 0, 100);
+  return spotify.CallAPI("PUT", base + "volume?volume_percent=" + String(volume) + "&device_id=" + spotify.DeviceId()).httpCode;
+}
 
-  byte version = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-  // Valid MFRC522 versions: 0x90, 0x91, 0x92, 0x88, 0x12. 0x00 or 0xFF indicates failure/freeze.
-  bool isHung = (version == 0x00 || version == 0xFF);
-
-  if (isHung || forceReset) {
-    if (forceReset) {
-      LOG("[RFID] Hardware reset pulse applied to MFRC522...");
-    } else {
-      LOG("[RFID] WARNING: Reader locked up (VersionReg: 0x" + String(version, HEX) + "). Triggering auto-recovery...");
+class AlbumSelection {
+  String artist;
+  AlbumOrder order;
+public:
+  int choose(const String& uri, String& album) {
+    String requested = uri.substring(15);
+    if (artist != requested || order.empty()) {
+      HttpResult response = spotify.CallAPI("GET", "https://api.spotify.com/v1/artists/" + requested + "/albums?include_groups=album,single&limit=1");
+      if (response.httpCode != 200) return response.httpCode;
+      JsonDocument doc;
+      if (deserializeJson(doc, response.payload) || !doc["total"].is<unsigned int>()) return 502;
+      unsigned total = doc["total"].as<unsigned>();
+      if (!total) return 404;
+      if (total > 5000) return 413;
+      unsigned count = total, start = 0;
+      if ((requested == "1l6d0RIxTL3JytlLGvWzYe" || requested == "3t2iKODSDyzoDJw7AsD99u") && total > 60) { count = 60; start = total - 60; }
+      std::vector<uint16_t> replacement(count);
+      for (unsigned i = 0; i < count; ++i) replacement[i] = start + i;
+      for (size_t i = count; i > 1; --i) std::swap(replacement[i - 1], replacement[esp_random() % i]);
+      order.commit(replacement); artist = requested;
     }
+    if (order.empty()) return 404;
+    if (order.exhausted()) order.reshuffle([] { return esp_random(); });
+    uint16_t index;
+    if (!order.current(index)) return 404;
+    HttpResult response = spotify.CallAPI("GET", "https://api.spotify.com/v1/artists/" + requested + "/albums?include_groups=album,single&limit=1&offset=" + String(index));
+    if (response.httpCode != 200) return response.httpCode;
+    JsonDocument doc;
+    if (deserializeJson(doc, response.payload)) return 502;
+    album = doc["items"][0]["uri"] | "";
+    char checked[SafeNdef::MaxUri];
+    if (!album.startsWith("spotify:album:") || !SafeNdef::normalize(album.c_str(), checked, sizeof(checked))) {
+      // Catalog changed; rebuild on the next scan rather than staying stuck on a removed offset.
+      order.clear(); artist = ""; return 404;
+    }
+    return 200;
+  }
+  void played() { order.played(); }
+};
 
-    // Hardware electrical reset pulse on RST_PIN
-    pinMode(SS_PIN, OUTPUT);
-    digitalWrite(SS_PIN, HIGH);
-    pinMode(RST_PIN, OUTPUT);
-    digitalWrite(RST_PIN, LOW);
-    delay(50);
-    digitalWrite(RST_PIN, HIGH);
-    delay(50);
-
-    mfrc522.PCD_Init();
-    delay(10);
-    nfc.begin();
-
-    byte newVer = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-    if (newVer != 0x00 && newVer != 0xFF) {
-      LOG("[RFID] Recovery SUCCESS: MFRC522 active (VersionReg: 0x" + String(newVer, HEX) + ")");
-      return true;
-    } else {
-      LOG("[RFID] Recovery WARNING: MFRC522 still unresponsive (VersionReg: 0x" + String(newVer, HEX) + ")");
-      return false;
+void fetchArt(const Job& job) {
+#if PLAYER_HAS_DISPLAY
+  String url;
+  {
+    HttpResult response = spotify.CallAPI("GET", "https://api.spotify.com/v1/me/player/currently-playing");
+    JsonDocument doc;
+    if (response.httpCode != 200 || deserializeJson(doc, response.payload)) return;
+    JsonArray images = doc["item"]["album"]["images"].as<JsonArray>();
+    // Prefer an image that fits the display; handle albums with only one size.
+    for (JsonObject image : images) {
+      if (url.isEmpty() || image["width"].as<int>() >= 240) url = image["url"] | "";
     }
   }
+  if (url.isEmpty() || heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < MAX_JPEG + 24 * 1024) return;
+  auto* bytes = static_cast<uint8_t*>(malloc(MAX_JPEG));
+  if (!bytes) return;
+  int count = spotify.DownloadFile(url, bytes, MAX_JPEG);
+  if (count < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 || bytes[count - 2] != 0xff || bytes[count - 1] != 0xd9) {
+    free(bytes); logMessage("[Art] Incomplete or unsupported image; retaining previous cover"); return;
+  }
+  uint8_t* smaller = static_cast<uint8_t*>(realloc(bytes, count));
+  if (smaller) bytes = smaller;
+  publish(job, 200, "", bytes, count);
+#else
+  (void)job;
+#endif
+}
+
+void networkWorker(void*) {
+  AlbumSelection albums;
+  bool wasConnected = false, pending = false;
+  Job retry{}; uint32_t retryAt = 0, maintenanceAt = millis() - 30000;
+  for (;;) {
+    bool connected = WiFi.status() == WL_CONNECTED;
+    if (connected != wasConnected) { spotify.ResetState(); wasConnected = connected; }
+    if (DeviceAuth::process(spotify)) {
+      Job authStatus{}; authStatus.command = Command::Status; publish(authStatus, 200);
+    }
+    Job job{};
+    bool received = xQueueReceive(jobs, &job, pdMS_TO_TICKS(50)) == pdTRUE;
+    if (received && pending && (job.command == Command::Play || job.command == Command::Select)) {
+      publish(retry, 409); pending = false; // New user intent supersedes old playback.
+    }
+    if (!received && pending && int32_t(millis() - retryAt) >= 0) { job = retry; received = true; pending = false; }
+    if (!received) {
+      if (millis() - maintenanceAt >= 30000) {
+        maintenanceAt = millis();
+        if (connected) spotify.EnsureTokenFresh();
+        Job statusJob{}; statusJob.command = Command::Status; publish(statusJob, 200);
+      }
+      continue;
+    }
+    int code = 400; String payload;
+    switch (job.command) {
+      case Command::Token: code = spotify.ReplaceRefreshToken(job.value) ? 200 : spotify.LastError(); break;
+      case Command::Refresh: code = spotify.EnsureTokenFresh(true) ? 200 : spotify.LastError(); break;
+      case Command::Devices: {
+        HttpResult response = spotify.CallAPI("GET", "https://api.spotify.com/v1/me/player/devices");
+        code = response.httpCode;
+        JsonDocument doc;
+        if (code == 200 && !deserializeJson(doc, response.payload)) {
+          JsonDocument filtered; JsonArray list = filtered["devices"].to<JsonArray>();
+          for (JsonObject device : doc["devices"].as<JsonArray>()) {
+            if (list.size() >= 16) break;
+            if (!device["id"].is<const char*>() || device["is_restricted"].as<bool>()) continue;
+            JsonObject item = list.add<JsonObject>();
+            item["id"] = device["id"]; item["name"] = device["name"]; item["type"] = device["type"];
+          }
+          serializeJson(filtered, payload);
+        } else if (code == 200) code = 502;
+        break;
+      }
+      case Command::Select: {
+        // Validate against live discovery; never trust a submitted id/name pair.
+        HttpResult response = spotify.CallAPI("GET", "https://api.spotify.com/v1/me/player/devices");
+        JsonDocument devices;
+        code = response.httpCode;
+        bool found = false;
+        if (code == 200 && !deserializeJson(devices, response.payload)) {
+          for (JsonObject device : devices["devices"].as<JsonArray>())
+            if (device["id"] == job.value && device["name"] == job.name && !device["is_restricted"].as<bool>()) found = true;
+          code = found ? 200 : 404;
+        } else if (code == 200) code = 502;
+        if (!found) break;
+        JsonDocument transfer; transfer["device_ids"].to<JsonArray>().add(job.value); transfer["play"] = true;
+        String body; serializeJson(transfer, body);
+        code = spotify.CallAPI("PUT", "https://api.spotify.com/v1/me/player", body).httpCode;
+        if (ok(code)) {
+          spotify.SelectDevice(job.name, job.value);
+          if (preferences.putString("device_name", job.name) != strlen(job.name)) code = 507;
+        }
+        break;
+      }
+      case Command::Play: {
+        String uri = job.value;
+        bool artist = uri.startsWith("spotify:artist:");
+        if (artist) { code = albums.choose(uri, uri); if (code != 200) break; }
+        if (spotify.DeviceId().isEmpty() && spotify.GetDevices().isEmpty()) { code = spotify.LastError() == 200 ? 404 : spotify.LastError(); break; }
+        code = spotify.CallAPI("PUT", "https://api.spotify.com/v1/me/player/shuffle?state=false&device_id=" + spotify.DeviceId()).httpCode;
+        if (!ok(code)) break;
+        code = spotify.Play(uri);
+        if (ok(code) && artist) albums.played();
+        break;
+      }
+      case Command::Next: case Command::Toggle: case Command::VolumeUp: case Command::VolumeDown:
+        code = control(job.command); break;
+      default: break;
+    }
+    // Token contents never enter logs/results. Remove the queued copy promptly.
+    if (job.command == Command::Token) memset(job.value, 0, sizeof(job.value));
+    if (job.command == Command::Play && !ok(code) && job.attempt < 2 && (code < 0 || code == 404 || code == 429 || code >= 500)) {
+      if (pending) publish(retry, 409);
+      retry = job; ++retry.attempt; retryAt = millis() + max(2000UL, (unsigned long)spotify.RetryInMs()); pending = true;
+      publish(job, 202); logMessage("[Playback] Retry scheduled (code " + String(code) + ")");
+    } else {
+      publish(job, code, payload);
+      logMessage("[Job " + String(job.id) + "] completed (code " + String(code) + ")");
+      if (job.command == Command::Play && ok(code) && uxQueueMessagesWaiting(jobs) == 0) fetchArt(job);
+    }
+  }
+}
+
+RfidRecovery::Registers readerRegisters() {
+  return {reader.PCD_ReadRegister(MFRC522::VersionReg), reader.PCD_ReadRegister(MFRC522::TxControlReg),
+    reader.PCD_ReadRegister(MFRC522::TModeReg), reader.PCD_ReadRegister(MFRC522::TPrescalerReg),
+    reader.PCD_ReadRegister(MFRC522::CommandReg)};
+}
+void logReaderRegisters(const char* label, const RfidRecovery::Registers& state) {
+  char line[176];
+  snprintf(line,sizeof(line),"[RFID] %s: version=0x%02X antenna=0x%02X timer=0x%02X prescaler=0x%02X command=0x%02X reset_pin=%d",
+    label,state.version,state.antenna,state.timer,state.prescaler,state.command,digitalRead(RST_PIN));
+  logMessage(line);
+}
+struct ReaderResetPins {
+  void output(uint8_t pin) { pinMode(pin,OUTPUT); }
+  void write(uint8_t pin, bool high) { digitalWrite(pin,high ? HIGH : LOW); }
+  void wait(unsigned ms) { delay(ms); }
+};
+bool readerHealth(bool force) {
+  digitalWrite(TFT_CS,HIGH);
+  auto registers=readerRegisters();
+  if (!force && !registers.healthy()) { delay(2); registers=readerRegisters(); }
+  if (force || !registers.healthy()) {
+    cardPresence.uncertain(); // Retain held-card identity across reset/recovery.
+    ++recoveries;
+    logReaderRegisters("Before recovery",registers);
+    digitalWrite(SS_PIN,HIGH);
+    ReaderResetPins pins;
+    RfidRecovery::reset(reader,pins,SS_PIN,RST_PIN);
+    registers=readerRegisters();
+    logReaderRegisters(registers.healthy() ? "Reader initialized" : "Hardware recovery failed",registers);
+  }
+  rfidVersion=registers.version; rfidOk=registers.healthy(); return registers.healthy();
+}
+void pollCard() {
+  static uint8_t errors = 0;
+  uint32_t now = millis(), previousPoll = lastPoll.exchange(now);
+  if (previousPoll && now - previousPoll > maxPollGap) maxPollGap = now - previousPoll;
+  if (!rfidOk) { cardPresence.uncertain(); return; }
+  digitalWrite(TFT_CS, HIGH);
+  reader.PCD_StopCrypto1();
+  uint8_t atqa[2], atqaSize = sizeof(atqa);
+  auto response = reader.PICC_WakeupA(atqa, &atqaSize);
+  if (response == MFRC522::STATUS_TIMEOUT) {
+    bool healthy=readerRegisters().healthy();
+    if (!healthy) healthy=readerHealth(false);
+    if (cardPresence.missing(millis(),healthy)) logMessage("[RFID] Card removed; ready for next presentation");
+    errors=0; return;
+  }
+  cardPresence.uncertain();
+  if ((response != MFRC522::STATUS_OK && response != MFRC522::STATUS_COLLISION) || !reader.PICC_ReadCardSerial()) {
+    ++readFailures; reader.PCD_StopCrypto1();
+    if (++errors >= 3) { readerHealth(true); errors = 0; }
+    return;
+  }
+  if (!cardPresence.seen(reader.uid.uidByte,reader.uid.size)) {
+    reader.PICC_HaltA(); reader.PCD_StopCrypto1(); errors=0; return;
+  }
+  ++scans;
+  char uri[SafeNdef::MaxUri] = {};
+  RfidReader tag(reader); bool valid = tag.spotifyUri(uri, sizeof(uri));
+  reader.PICC_HaltA(); reader.PCD_StopCrypto1();
+  if (!valid) {
+    ++readFailures;
+    logMessage(tag.ioError ? "[RFID] Card read failed; remove and retry" : "[RFID] Unsupported or malformed Spotify NDEF record");
+    if (tag.ioError && ++errors >= 3) { readerHealth(true); errors = 0; }
+    return;
+  }
+  errors = 0;
+  Job job{}; job.command = Command::Play; strlcpy(job.value, uri, sizeof(job.value));
+  if (submit(job)) logMessage("[RFID] Queued " + String(uri) + " as job " + String(job.id));
+}
+#if PLAYER_HAS_DISPLAY
+void infoScreen() {
+  digitalWrite(SS_PIN, HIGH); tft.fillScreen(ILI9341_BLACK); tft.setTextColor(ILI9341_GREEN); tft.setTextSize(2); tft.setCursor(12, 30);
+  tft.println("Spotify RFID Player"); tft.setTextColor(ILI9341_WHITE); tft.setTextSize(1); tft.setCursor(12, 80);
+  tft.println("IP: " + WiFi.localIP().toString()); tft.setCursor(12, 105); tft.println("http://" + String(DeviceAuth::hostname()) + ".local/");
+  tft.setCursor(12, 140); tft.println(PLAYER_REQUIRE_WEB_AUTH ? "Admin login: see USB Serial at boot" : "Web UI: no login required");
+}
+bool decodeCover(uint8_t* bytes, size_t size, bool draw) {
+  JpegDec.abort();
+  if (!JpegDec.decodeArray(bytes, size) || JpegDec.width > 640 || JpegDec.height > 640) { JpegDec.abort(); return false; }
+  int expected = JpegDec.MCUSPerRow * JpegDec.MCUSPerCol, count = 0;
+  if (draw) { digitalWrite(SS_PIN, HIGH); tft.fillScreen(ILI9341_BLACK); }
+  while (JpegDec.read()) {
+    ++count;
+    if (draw) {
+      int x = JpegDec.MCUx * JpegDec.MCUWidth, y = JpegDec.MCUy * JpegDec.MCUHeight - 30;
+      digitalWrite(SS_PIN, HIGH);
+      // One SPI transaction per MCU, rather than one per pixel.
+      tft.drawRGBBitmap(x, y, JpegDec.pImage, JpegDec.MCUWidth, JpegDec.MCUHeight);
+    }
+    if (millis() - lastPoll >= 100) pollCard();
+    taskYIELD();
+  }
+  JpegDec.abort(); return count == expected;
+}
+#endif
+void hardwareWorker(void*) {
+  pinMode(SS_PIN, OUTPUT); digitalWrite(SS_PIN, HIGH);
+  pinMode(TFT_CS, OUTPUT); digitalWrite(TFT_CS, HIGH); pinMode(RST_PIN, OUTPUT);
+  SPI.begin(18, 19, 23);
+#if PLAYER_HAS_DISPLAY
+  tft.begin(); tft.setRotation(1); infoScreen();
+  logMessage("[Display] TFT enabled; initialization and info-screen draw completed");
+  uint8_t* cachedImage = nullptr; size_t cachedSize = 0;
+  uint32_t screenAt = millis();
+#endif
+  readerHealth(true);
+  uint32_t lastHealth = millis();
+  for (;;) {
+    if (millis() - lastPoll >= 100) pollCard();
+    if (millis() - lastHealth >= (rfidOk ? 30000UL : 5000UL)) { readerHealth(false); lastHealth = millis(); }
+    DisplayJob job{};
+    if (xQueueReceive(displayJobs, &job, 0) == pdTRUE) {
+      switch (job.action) {
+#if PLAYER_HAS_DISPLAY
+        case DisplayAction::Image:
+          if (decodeCover(job.image, job.size, false)) {
+            free(cachedImage); cachedImage = job.image; cachedSize = job.size;
+            decodeCover(cachedImage, cachedSize, true); screenAt = millis();
+          } else { free(job.image); logMessage("[Art] JPEG invalid; previous cover retained"); }
+          break;
+        case DisplayAction::Cached: if (cachedImage) { decodeCover(cachedImage, cachedSize, true); screenAt = millis(); } break;
+        case DisplayAction::Info: infoScreen(); screenAt = millis(); break;
+        case DisplayAction::Clear: digitalWrite(SS_PIN, HIGH); tft.fillScreen(ILI9341_BLACK); screenAt = 0; break;
+#else
+        case DisplayAction::Image: free(job.image); break;
+        case DisplayAction::Cached: case DisplayAction::Info: case DisplayAction::Clear: break;
+#endif
+        case DisplayAction::Reset: readerHealth(true); break;
+      }
+    }
+#if PLAYER_HAS_DISPLAY
+    if (screenAt && millis() - screenAt > 600000UL) { digitalWrite(SS_PIN, HIGH); tft.fillScreen(ILI9341_BLACK); screenAt = 0; }
+#endif
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+#include "Dashboard.h"
+bool authorized(bool mutation = false) {
+#if PLAYER_REQUIRE_WEB_AUTH
+  if (!webServer.authenticate("admin", adminPassword.c_str())) {
+    webServer.requestAuthentication(DIGEST_AUTH, "Spotify RFID", "Authentication required"); return false;
+  }
+  #endif
+  if (mutation && webServer.header("X-Requested-With") != "RFIDPlayer") {
+    webServer.send(403, "application/json", "{\"message\":\"Missing request header\"}"); return false;
+  }
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.sendHeader("X-Content-Type-Options", "nosniff");
+  webServer.sendHeader("X-Frame-Options", "DENY");
   return true;
 }
-
-// --- Spotify client ---
-SpotifyClient spotify(clientId, clientSecret, deviceName, refreshToken);
-static String currentDeviceId = "";
-
-// --- Forward declarations ---
-void handleApiResetRfid();
-void handleWebRoot();
-void handleWebUpdate();
-void handleApiLogs();
-void handleApiRestart();
-void handleApiRescan();
-void handleApiNext();
-void handleApiPlayPause();
-void handleApiVolumeUp();
-void handleApiVolumeDown();
-void handleApiDevices();
-void handleApiSelectDevice();
-void handleApiStatus();
-void handleApiClearScreen();
-void handleApiRefreshToken();
-void printTelnetHelp();
-void printTelnetStatus();
-void togglePlayPause();
-void adjustVolume(int delta);
-void updateCpuLoad(unsigned long activeMicros);
-void handleTelnet();
-void connectWifi();
-void ensureWifiConnected();
-void logError(const String& msg, int code);
-void readNFCTag();
-void playSpotifyUri(const String& uri);
-void disableShuffle();
-void playRandomAlbumFromArtist(const String& artistUri);
-void showAlbumArt();
-void showLastImage();
-void showDeviceInfoScreen();
-void handleApiShowInfo();
-void renderJPEG(int xPos, int yPos);
-
-void onSpotifyTokenRotated(const String& newToken) {
-  preferences.putString("ref_token", newToken);
-  LOG("[Main] Rolling refresh token automatically saved to NVS flash: " + newToken.substring(0, 10) + "...");
+void handleCommand(Command command) {
+  if (!authorized(true)) return;
+  Job job{}; job.command = command;
+  if (command == Command::Token || command == Command::Select) {
+    String body = webServer.arg("plain"); JsonDocument doc;
+    if (body.length() > 1536 || deserializeJson(doc, body)) { webServer.send(400, "application/json", "{\"message\":\"Invalid JSON\"}"); return; }
+    String value = doc[command == Command::Token ? "token" : "id"] | ""; value.trim();
+    String name = doc["name"] | "";
+    if (value.isEmpty() || value.length() >= sizeof(job.value) || (command == Command::Select && (value.length() >= 96 || name.isEmpty() || name.length() >= sizeof(job.name)))) {
+      webServer.send(400, "application/json", "{\"message\":\"Missing or oversized value\"}"); return;
+    }
+    strlcpy(job.value, value.c_str(), sizeof(job.value)); strlcpy(job.name, name.c_str(), sizeof(job.name));
+  }
+  if (!submit(job)) { webServer.send(503, "application/json", "{\"message\":\"Command queue full; try again\"}"); return; }
+  rememberJob(job.id, 202);
+  webServer.send(202, "application/json", "{\"job\":" + String(job.id) + "}");
 }
-
+void handleDisplay(DisplayAction action) {
+  if (!authorized(true)) return;
+#if !PLAYER_HAS_DISPLAY
+  if (action != DisplayAction::Reset) {
+    webServer.send(409, "application/json", "{\"message\":\"This player has no display\"}"); return;
+  }
+#endif
+  DisplayJob job{}; job.action = action;
+  bool sent = xQueueSend(displayJobs, &job, 0) == pdTRUE;
+  webServer.send(sent ? 202 : 503, "application/json", sent ? "{\"message\":\"Display/reader request queued\"}" : "{\"message\":\"Hardware queue full\"}");
+}
+void handleStatus() {
+  if (!authorized()) return;
+  JsonDocument doc;
+  doc["firmware_build"] = firmwareBuild;
+  doc["has_display"] = bool(PLAYER_HAS_DISPLAY);
+  doc["web_auth_required"] = bool(PLAYER_REQUIRE_WEB_AUTH);
+  doc["reset_reason"] = int(esp_reset_reason()); doc["reset_reason_name"] = resetReasonName();
+  doc["certificate_days"] = DeviceAuth::certificateDays();
+  doc["certificate_automatic"] = DeviceIdentity::automatic();
+  doc["certificate_renewal"] = DeviceIdentity::renewalStatus();
+  doc["certificate_issuer_days"] = DeviceIdentity::issuerDays();
+  doc["reconnect_ready"] = DeviceAuth::ready(); doc["reconnect_url"] = DeviceAuth::url();
+  doc["uptime_seconds"] = esp_timer_get_time() / 1000000ULL;
+  doc["free_heap"] = ESP.getFreeHeap(); doc["min_heap"] = ESP.getMinFreeHeap();
+  doc["largest_heap"] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  doc["wifi_rssi"] = WiFi.RSSI(); doc["ip"] = WiFi.localIP().toString();
+  doc["device_name"] = status.name; doc["device_id"] = status.device;
+  doc["token_unsaved"] = status.unsaved;
+  doc["token_valid"] = status.tokenValid; doc["revoked"] = status.revoked;
+  uint32_t elapsed = millis() - status.at;
+  doc["retry_ms"] = elapsed < status.retryMs ? status.retryMs - elapsed : 0;
+  doc["rfid_ok"] = rfidOk.load(); doc["rfid_version"] = String(rfidVersion.load(), HEX);
+  doc["scans"] = scans.load(); doc["read_failures"] = readFailures.load(); doc["recoveries"] = recoveries.load();
+  doc["max_poll_gap_ms"] = maxPollGap.load(); doc["poll_age_ms"] = millis() - lastPoll.load(); doc["dropped_logs"] = droppedLogs.load();
+  doc["network_stack_free"] = uxTaskGetStackHighWaterMark(networkTaskHandle);
+  doc["hardware_stack_free"] = uxTaskGetStackHighWaterMark(hardwareTaskHandle);
+  JsonArray recent = doc["jobs"].to<JsonArray>();
+  for (const auto& job : jobStatus) if (job.id) { JsonObject entry = recent.add<JsonObject>(); entry["id"] = job.id; entry["code"] = job.code; }
+  String out; serializeJson(doc, out); webServer.send(200, "application/json", out);
+}
+void setupWeb() {
+  const char* headers[] = {"X-Requested-With"}; webServer.collectHeaders(headers, 1);
+  webServer.on("/", HTTP_GET, [] { if (authorized()) webServer.send_P(200, "text/html; charset=utf-8", dashboard); });
+  webServer.on("/api/status", HTTP_GET, handleStatus);
+  webServer.on("/api/devices", HTTP_GET, [] { if (authorized()) webServer.send(200, "application/json", devicesJson); });
+  webServer.on("/api/logs", HTTP_GET, [] {
+    if (!authorized()) return;
+    String out; out.reserve(48 * 224);
+    for (size_t i = 0; i < logCount; ++i) out += logHistory[(logHead + 48 - logCount + i) % 48] + '\n';
+    webServer.send(200, "text/plain", out);
+  });
+  webServer.on("/api/token", HTTP_POST, [] { handleCommand(Command::Token); });
+  webServer.on("/update", HTTP_POST, [] { handleCommand(Command::Token); });
+  webServer.on("/api/refresh_token", HTTP_POST, [] { handleCommand(Command::Refresh); });
+  webServer.on("/api/rescan", HTTP_POST, [] { handleCommand(Command::Devices); });
+  webServer.on("/api/select_device", HTTP_POST, [] { handleCommand(Command::Select); });
+  webServer.on("/api/next", HTTP_POST, [] { handleCommand(Command::Next); });
+  webServer.on("/api/playpause", HTTP_POST, [] { handleCommand(Command::Toggle); });
+  webServer.on("/api/volup", HTTP_POST, [] { handleCommand(Command::VolumeUp); });
+  webServer.on("/api/voldown", HTTP_POST, [] { handleCommand(Command::VolumeDown); });
+  webServer.on("/api/reset_rfid", HTTP_POST, [] { handleDisplay(DisplayAction::Reset); });
+  webServer.on("/api/show_info", HTTP_POST, [] { handleDisplay(DisplayAction::Info); });
+  webServer.on("/api/show_image", HTTP_POST, [] { handleDisplay(DisplayAction::Cached); });
+  webServer.on("/api/clear_screen", HTTP_POST, [] { handleDisplay(DisplayAction::Clear); });
+  webServer.on("/api/restart", HTTP_POST, [] {
+    if (!authorized(true)) return;
+    webServer.send(200, "application/json", "{\"message\":\"Restarting\"}"); delay(100); ESP.restart();
+  });
+  webServer.onNotFound([] { webServer.send(404, "application/json", "{\"message\":\"Not found\"}"); });
+  webServer.begin();
+}
 void setup() {
   Serial.begin(115200);
-  LOG("[Main] Setup started");
-
-  SPI.begin(18, 19, 23); // Correct SPI pins for your device
-  tft.begin();
-  tft.setRotation(1);
-  tft.fillScreen(ILI9341_BLACK);
-
-  connectWifi();
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // Sync clock for TLS/NTP
-
-  if (MDNS.begin("spotify-player")) {
-    MDNS.addService("http", "tcp", 80);
-    LOG("[Main] mDNS active: http://spotify-player.local/");
+  logs = xQueueCreate(24, sizeof(LogLine)); jobs = xQueueCreate(4, sizeof(Job));
+  results = xQueueCreate(8, sizeof(Result)); displayJobs = xQueueCreate(3, sizeof(DisplayJob));
+  if (!logs || !jobs || !results || !displayJobs || !preferences.begin("spotify", false)) {
+    Serial.println("Fatal: cannot allocate queues/open NVS"); while (true) delay(1000);
   }
-
-  // Display boot diagnostics on TFT
-  showDeviceInfoScreen();
-
-  telnetServer.begin();
-  telnetServer.setNoDelay(true);
-  LOG("[Telnet] Server started on port 23");
-
-  // Hook up automatic rolling token persistence
-  spotify.SetRefreshTokenCallback(onSpotifyTokenRotated);
-
-  // Load or seed refresh token from persistent NVS flash
-  preferences.begin("spotify", false);
-  String savedToken = preferences.getString("ref_token", "");
-  if (refreshToken.length() > 0 && refreshToken != savedToken) {
-    LOG("[Main] Updating NVS flash with new token from settings.h");
-    preferences.putString("ref_token", refreshToken);
-    spotify.SetRefreshToken(refreshToken);
-  } else if (savedToken.length() > 0) {
-    LOG("[Main] Loaded refresh token from NVS flash");
-    spotify.SetRefreshToken(savedToken);
-  } else if (refreshToken.length() > 0) {
-    LOG("[Main] Initializing NVS flash with settings.h refresh token");
-    preferences.putString("ref_token", refreshToken);
-    spotify.SetRefreshToken(refreshToken);
-  }
-
-  // Load custom speaker preference from NVS if saved
-  String savedSpeaker = preferences.getString("device_name", "");
-  if (!savedSpeaker.isEmpty()) {
-    deviceName = savedSpeaker;
-    LOG("[Main] Loaded target speaker from NVS: " + deviceName);
-  }
-
-  // Setup Web Portal & REST endpoints
-  webServer.on("/", HTTP_GET, handleWebRoot);
-  webServer.on("/update", HTTP_POST, handleWebUpdate);
-  webServer.on("/api/token", HTTP_POST, handleWebUpdate);
-  webServer.on("/api/logs", HTTP_GET, handleApiLogs);
-  webServer.on("/api/restart", HTTP_POST, handleApiRestart);
-  webServer.on("/api/rescan", HTTP_POST, handleApiRescan);
-  webServer.on("/api/next", HTTP_POST, handleApiNext);
-  webServer.on("/api/playpause", HTTP_POST, handleApiPlayPause);
-  webServer.on("/api/volup", HTTP_POST, handleApiVolumeUp);
-  webServer.on("/api/voldown", HTTP_POST, handleApiVolumeDown);
-  webServer.on("/api/devices", HTTP_GET, handleApiDevices);
-  webServer.on("/api/select_device", HTTP_POST, handleApiSelectDevice);
-  webServer.on("/api/status", HTTP_GET, handleApiStatus);
-  webServer.on("/api/clear_screen", HTTP_POST, handleApiClearScreen);
-  webServer.on("/api/show_image", HTTP_POST, handleApiShowImage);
-  webServer.on("/api/show_info", HTTP_POST, handleApiShowInfo);
-  webServer.on("/api/reset_rfid", HTTP_POST, handleApiResetRfid);
-  webServer.on("/api/refresh_token", HTTP_POST, handleApiRefreshToken);
-  webServer.begin();
-  LOG("[Web] HTTP portal ready at http://" + WiFi.localIP().toString() + "/ or http://spotify-player.local/");
-
-  // Physical hardware reset of MFRC522 on boot
-  pinMode(SS_PIN, OUTPUT);
-  digitalWrite(SS_PIN, HIGH);
-  pinMode(TFT_CS, OUTPUT);
-  digitalWrite(TFT_CS, HIGH);
-  checkAndRecoverMFRC522(true);
-
-  if (!spotify.EnsureTokenFresh()) {
-    LOG("[Main] WARNING: initial token fetch failed");
+  String saved; bool savedPkce = false;
+  String authRecord = preferences.getString("auth_v2", "");
+  if (!authRecord.isEmpty()) {
+    JsonDocument doc;
+    if (deserializeJson(doc, authRecord) || !doc["token"].is<const char*>() || !doc["pkce"].is<bool>()) {
+      Serial.println("WARNING: invalid stored authentication; reconnect through the web UI");
+    } else { saved = doc["token"].as<String>(); savedPkce = doc["pkce"].as<bool>(); }
   } else {
-    currentDeviceId = spotify.GetDevices();
-    LOG("[Main] Stored Device ID: " + currentDeviceId);
+    saved = preferences.getString("ref_token", "");
+    if (saved.isEmpty()) saved = refreshToken;
+    if (!saved.isEmpty() && !saveToken(saved, false)) Serial.println("WARNING: bootstrap token could not be saved");
+  }
+  spotify.SetRefreshToken(saved, savedPkce); spotify.SetRefreshTokenCallback(saveToken);
+  spotify.SelectDevice(preferences.getString("device_name", deviceName)); status.name = spotify.DeviceName();
+  #if PLAYER_REQUIRE_WEB_AUTH
+  adminPassword = preferences.getString("admin_pass", "");
+  if (adminPassword.isEmpty()) {
+    char randomPassword[33];
+    for (int i = 0; i < 4; ++i) snprintf(randomPassword + 8 * i, 9, "%08lx", (unsigned long)esp_random());
+    adminPassword = randomPassword;
+    if (preferences.putString("admin_pass", adminPassword) != adminPassword.length()) {
+      Serial.println("Fatal: cannot persist admin password"); while (true) delay(1000);
+    }
+  }
+  // Deliberately USB-only: never add this password to web logs.
+  Serial.println("Admin username: admin; password: " + adminPassword);
+  #else
+  Serial.println("Web UI: login disabled (internal LAN)");
+  #endif
+  logMessage("[Boot] Build " + String(firmwareBuild) + "; TFT=" + String(PLAYER_HAS_DISPLAY));
+  logMessage("[Boot] Reset reason " + String(esp_reset_reason()) + " (" + resetReasonName() + ")");
+  WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(true); WiFi.begin(ssid, pass);
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  DeviceAuth::begin(clientId, adminPassword);
+  setupWeb();
+  if (xTaskCreate(hardwareWorker, "rfid-display", 8192, nullptr, 2, &hardwareTaskHandle) != pdPASS ||
+      xTaskCreate(networkWorker, "spotify", 14336, nullptr, 1, &networkTaskHandle) != pdPASS) {
+    Serial.println("Fatal: task creation failed"); while (true) delay(1000);
   }
 }
-
 void loop() {
-  unsigned long workStart = micros();
-
-  handleTelnet();
+  // HTTP/serial backpressure can delay the dashboard, but never RFID polling.
   webServer.handleClient();
-  ensureWifiConnected();
-
-  static bool wasDisconnected = false;
-  if (WiFi.status() != WL_CONNECTED) {
-    wasDisconnected = true;
-  } else if (wasDisconnected) {
-    LOG("[Main] Wi-Fi reconnected (" + WiFi.localIP().toString() + ") -> re-binding services");
-    spotify.ResetState();
-    currentDeviceId = ""; // Force re-fetch of device ID after reconnect
-    webServer.close();
-    webServer.begin();
-    telnetServer.begin();
-    MDNS.end();
-    MDNS.begin("spotify-player");
-    wasDisconnected = false;
+  static bool wasConnected = false; static uint32_t retryAt = 0;
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected && !wasConnected) {
+    MDNS.end(); if (MDNS.begin(DeviceAuth::hostname())) MDNS.addService("http", "tcp", 80);
+    webServer.close(); webServer.begin(); logMessage("[WiFi] Connected at " + WiFi.localIP().toString());
   }
-
-  // Periodic MFRC522 card reader health check and auto-recovery (every 30 seconds)
-  static unsigned long lastRfidCheck = 0;
-  if (millis() - lastRfidCheck > 30000UL) {
-    lastRfidCheck = millis();
-    checkAndRecoverMFRC522(false);
-  }
-
-  // Daily keep-alive: Keeps Spotify token fresh and resets Spotify's 180-day inactivity timer
-  static unsigned long lastKeepAlive = 0;
-  if (millis() - lastKeepAlive > 24UL * 60UL * 60UL * 1000UL) {
-    lastKeepAlive = millis();
-    LOG("[Main] Performing daily Spotify token keep-alive check...");
-    spotify.EnsureTokenFresh();
-  }
-
-  readNFCTag(); // Replaced the old check with the new function call
-
-  // 10-minute idle -> clear screen to prevent TFT image persistence & save power
-  if (lastScreenActivityMillis && (millis() - lastScreenActivityMillis > 10UL * 60UL * 1000UL)) {
-    digitalWrite(SS_PIN, HIGH);
-    tft.fillScreen(ILI9341_BLACK);
-    lastScreenActivityMillis = 0;
-    LOG("[Main] Screen blanked after 10 min idle to protect TFT");
-  }
-
-  unsigned long workElapsed = micros() - workStart;
-  updateCpuLoad(workElapsed);
-
-  delay(20); // Small delay to yield to Wi-Fi and web stack
-}
-
-// --- CPU Load Tracking & Helpers ---
-static unsigned long activeWorkMicrosAcc = 0;
-static unsigned long lastCpuReportMillis = 0;
-static float cpuLoadPercent = 0.0f;
-
-void updateCpuLoad(unsigned long activeMicros) {
-  activeWorkMicrosAcc += activeMicros;
-  unsigned long now = millis();
-  if (now - lastCpuReportMillis >= 1000) {
-    unsigned long totalElapsedMicros = (now - lastCpuReportMillis) * 1000UL;
-    if (totalElapsedMicros > 0) {
-      cpuLoadPercent = ((float)activeWorkMicrosAcc / (float)totalElapsedMicros) * 100.0f;
-      if (cpuLoadPercent > 100.0f) cpuLoadPercent = 100.0f;
-    }
-    activeWorkMicrosAcc = 0;
-    lastCpuReportMillis = now;
-  }
-}
-
-// --- Interactive Commands & Helpers ---
-static int currentVolume = 50;
-static bool isPaused = false;
-
-void togglePlayPause() {
-  if (currentDeviceId.isEmpty()) currentDeviceId = spotify.GetDevices();
-  if (currentDeviceId.isEmpty()) {
-    LOG("[Main] Cannot toggle playback: Device ID empty.");
-    return;
-  }
-  if (!isPaused) {
-    LOG("[Main] Pausing playback...");
-    spotify.CallAPI("PUT", "https://api.spotify.com/v1/me/player/pause?device_id=" + currentDeviceId, "");
-    isPaused = true;
-  } else {
-    LOG("[Main] Resuming playback...");
-    spotify.CallAPI("PUT", "https://api.spotify.com/v1/me/player/play?device_id=" + currentDeviceId, "");
-    isPaused = false;
-  }
-}
-
-void adjustVolume(int delta) {
-  if (currentDeviceId.isEmpty()) currentDeviceId = spotify.GetDevices();
-  if (currentDeviceId.isEmpty()) {
-    LOG("[Main] Cannot adjust volume: Device ID empty.");
-    return;
-  }
-  currentVolume = constrain(currentVolume + delta, 0, 100);
-  LOG("[Main] Volume set to " + String(currentVolume) + "%");
-  spotify.CallAPI("PUT", "https://api.spotify.com/v1/me/player/volume?volume_percent=" + String(currentVolume) + "&device_id=" + currentDeviceId, "");
-}
-
-void printTelnetHelp() {
-  if (!telnetClient || !telnetClient.connected()) return;
-  telnetClient.println("\n+-------------------------------------------------------+");
-  telnetClient.println("|         Spotify RFID Player - Keyboard Commands       |");
-  telnetClient.println("+-------------------------------------------------------+");
-  telnetClient.println("| [?] or [h] : Show this help menu                      |");
-  telnetClient.println("| [s]        : Show system status (CPU, RAM, Uptime)    |");
-  telnetClient.println("| [d]        : Discover & list all Spotify speakers     |");
-  telnetClient.println("| [t]        : Test & force Spotify token refresh       |");
-  telnetClient.println("| [n]        : Skip to Next track                       |");
-  telnetClient.println("| [p]        : Play / Pause toggle                      |");
-  telnetClient.println("| [+] / [-]  : Volume Up (+10%) / Down (-10%)           |");
-  telnetClient.println("| [c]        : Clear TFT screen                         |");
-  telnetClient.println("| [i] or [a] : Show last/current album art on TFT       |");
-  telnetClient.println("| [w]        : Show device info / status on TFT         |");
-  telnetClient.println("| [k]        : Test & reset MFRC522 card reader         |");
-  telnetClient.println("| [l]        : Replay full log history                  |");
-  telnetClient.println("| [r]        : Reboot ESP32                             |");
-  telnetClient.println("+-------------------------------------------------------+\n");
-}
-
-void printTelnetStatus() {
-  if (!telnetClient || !telnetClient.connected()) return;
-  unsigned long sec = millis() / 1000;
-  unsigned long days = sec / 86400; sec %= 86400;
-  unsigned long hrs = sec / 3600; sec %= 3600;
-  unsigned long mins = sec / 60; sec %= 60;
-
-  byte rfidVer = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-
-  telnetClient.println("\n================ SYSTEM STATUS ================");
-  telnetClient.printf(" CPU Load      : %.1f%% (@ %d MHz)\n", cpuLoadPercent, ESP.getCpuFreqMHz());
-  telnetClient.printf(" Free Heap RAM : %u bytes (Min: %u)\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
-  telnetClient.printf(" Uptime        : %lud %luh %lum %lus\n", days, hrs, mins, sec);
-  telnetClient.println(" Wi-Fi SSID    : " + String(ssid) + " (" + String(WiFi.RSSI()) + " dBm)");
-  telnetClient.println(" ESP32 IP      : " + WiFi.localIP().toString());
-  telnetClient.println(" Target Speaker: " + deviceName + " (" + (currentDeviceId.isEmpty() ? "Disconnected" : "ID: " + currentDeviceId) + ")");
-  telnetClient.println(" Token Status  : " + String(spotify.IsTokenValid() ? "ACTIVE & VALID" : "EXPIRED / REVOKED"));
-  telnetClient.printf(" Card Reader   : %s (VersionReg: 0x%02X)\n", (rfidVer != 0x00 && rfidVer != 0xFF) ? "ONLINE" : "FROZEN/OFFLINE", rfidVer);
-  telnetClient.println(" Volume        : " + String(currentVolume) + "%");
-  telnetClient.println(" Web Portal    : http://" + WiFi.localIP().toString() + "/ or http://spotify-player.local/");
-  telnetClient.println("===============================================\n");
-}
-
-// --- Telnet & Web helpers ---
-void handleTelnet() {
-  // Clean up if client disconnected on their side
-  if (telnetClient && !telnetClient.connected()) {
-    telnetClient.stop();
-  }
-
-  // Handle incoming connections
-  if (telnetServer.hasClient()) {
-    WiFiClient newClient = telnetServer.available();
-    // If a client was already connected, supersede it cleanly (no more "Busy - one client only")
-    if (telnetClient && telnetClient.connected()) {
-      telnetClient.println("\n[Telnet] Session taken over by new connection. Disconnecting.");
-      telnetClient.stop();
-    }
-    telnetClient = newClient;
-    telnetClient.setNoDelay(true);
-
-    telnetClient.println("==================================================");
-    telnetClient.println("  Spotify RFID Player - Live Console");
-    telnetClient.println("  Type '?' or 'h' for list of keyboard commands");
-    telnetClient.println("==================================================\n");
-
-    for (auto &line : logHistory) {
-      telnetClient.println(line);
-    }
-    LOG("[Telnet] Client connected");
-
-    if (!spotify.IsTokenValid()) {
-      telnetClient.println("\n-------------------------------------------------------------");
-      telnetClient.println("[Telnet] NOTE: Spotify token is currently EXPIRED / REVOKED.");
-      telnetClient.println("[Telnet] To renew without re-flashing your ESP32:");
-      telnetClient.println("[Telnet]   1. Run 'python3 renew_token.py' on your Mac, OR");
-      telnetClient.println("[Telnet]   2. Open http://" + WiFi.localIP().toString() + "/ in your browser");
-      telnetClient.println("-------------------------------------------------------------\n");
+  if (!connected && millis() - retryAt >= 15000) { retryAt = millis(); WiFi.reconnect(); }
+  DeviceAuth::tick(connected);
+  static bool httpsAdvertised = false;
+  if (!connected) httpsAdvertised = false;
+  if (connected && DeviceAuth::ready() && !httpsAdvertised) { MDNS.addService("https", "tcp", 443); httpsAdvertised = true; }
+  wasConnected = connected;
+  Result result{};
+  while (xQueueReceive(results, &result, 0) == pdTRUE) {
+    status.unsaved = result.unsaved; status.tokenValid = result.tokenValid; status.revoked = result.revoked; status.retryMs = result.retryMs; status.at = millis();
+    status.name = result.name; status.device = result.device;
+    rememberJob(result.id, result.code);
+    if (result.command == Command::Devices) devicesJson = result.code == 200 && result.payload ? result.payload : "{\"devices\":[]}";
+    free(result.payload);
+    if (result.image) {
+      DisplayJob display{}; display.action = DisplayAction::Image; display.image = result.image; display.size = result.imageSize;
+      if (xQueueSend(displayJobs, &display, 0) != pdTRUE) free(result.image);
     }
   }
-
-  // Handle interactive keyboard commands from Telnet client
-  while (telnetClient && telnetClient.connected() && telnetClient.available()) {
-    char c = telnetClient.read();
-    if (c == '\r' || c == '\n') continue;
-
-    if (c == '?' || c == 'h' || c == 'H') {
-      printTelnetHelp();
-    } else if (c == 's' || c == 'S') {
-      printTelnetStatus();
-    } else if (c == 'r' || c == 'R') {
-      telnetClient.println("[Telnet] Rebooting ESP32 in 1 second...");
-      delay(1000);
-      ESP.restart();
-    } else if (c == 't' || c == 'T') {
-      telnetClient.println("[Telnet] Refreshing Spotify token...");
-      spotify.EnsureTokenFresh();
-    } else if (c == 'd' || c == 'D') {
-      telnetClient.println("[Telnet] Searching for Spotify speaker devices...");
-      currentDeviceId = spotify.GetDevices();
-      telnetClient.println("[Telnet] Active Device ID: " + currentDeviceId);
-    } else if (c == 'n' || c == 'N') {
-      telnetClient.println("[Telnet] Skipping to next track...");
-      spotify.Next();
-    } else if (c == 'p' || c == 'P') {
-      togglePlayPause();
-      telnetClient.println(isPaused ? "[Telnet] Playback paused." : "[Telnet] Playback resumed.");
-    } else if (c == '+' || c == '=') {
-      adjustVolume(10);
-      telnetClient.println("[Telnet] Volume: " + String(currentVolume) + "%");
-    } else if (c == '-' || c == '_') {
-      adjustVolume(-10);
-      telnetClient.println("[Telnet] Volume: " + String(currentVolume) + "%");
-    } else if (c == 'c' || c == 'C') {
-      telnetClient.println("[Telnet] Clearing TFT screen...");
-      digitalWrite(SS_PIN, HIGH);
-      tft.fillScreen(ILI9341_BLACK);
-      lastScreenActivityMillis = 0;
-    } else if (c == 'i' || c == 'I' || c == 'a' || c == 'A') {
-      telnetClient.println("[Telnet] Showing last / current album art on TFT...");
-      showLastImage();
-    } else if (c == 'w' || c == 'W') {
-      telnetClient.println("[Telnet] Showing device info screen on TFT...");
-      showDeviceInfoScreen();
-    } else if (c == 'k' || c == 'K') {
-      telnetClient.println("[Telnet] Testing & resetting MFRC522 card reader...");
-      bool ok = checkAndRecoverMFRC522(true);
-      telnetClient.println(ok ? "[Telnet] Card reader is ONLINE & HEALTHY" : "[Telnet] Card reader FAILED recovery");
-    } else if (c == 'l' || c == 'L') {
-      telnetClient.println("\n--- LOG HISTORY REPLAY ---");
-      for (auto &line : logHistory) {
-        telnetClient.println(line);
-      }
-      telnetClient.println("--- END LOG REPLAY ---\n");
-    } else {
-      telnetClient.println("[Telnet] Unknown key '" + String(c) + "'. Press '?' for commands.");
-    }
+  LogLine line{};
+  for (int i = 0; i < 8 && xQueueReceive(logs, &line, 0) == pdTRUE; ++i) {
+    logHistory[logHead] = line.text; logHead = (logHead + 1) % 48; if (logCount < 48) ++logCount;
+    Serial.println(line.text);
   }
-}
-
-void handleApiLogs() {
-  String out = "";
-  for (auto &line : logHistory) {
-    out += line + "\n";
-  }
-  webServer.send(200, "text/plain", out);
-}
-
-void handleApiRestart() {
-  webServer.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Rebooting\"}");
-  delay(500);
-  ESP.restart();
-}
-
-void handleApiRescan() {
-  currentDeviceId = spotify.GetDevices();
-  webServer.send(200, "application/json", "{\"status\":\"ok\",\"deviceId\":\"" + currentDeviceId + "\"}");
-}
-
-void handleApiNext() {
-  spotify.Next();
-  webServer.send(200, "application/json", "{\"status\":\"ok\"}");
-}
-
-void handleApiPlayPause() {
-  togglePlayPause();
-  webServer.send(200, "application/json", "{\"status\":\"ok\",\"isPaused\":" + String(isPaused ? "true" : "false") + "}");
-}
-
-void handleApiVolumeUp() {
-  adjustVolume(10);
-  webServer.send(200, "application/json", "{\"status\":\"ok\",\"volume\":" + String(currentVolume) + "}");
-}
-
-void handleApiVolumeDown() {
-  adjustVolume(-10);
-  webServer.send(200, "application/json", "{\"status\":\"ok\",\"volume\":" + String(currentVolume) + "}");
-}
-
-void handleApiDevices() {
-  HttpResult res = spotify.CallAPI("GET", "https://api.spotify.com/v1/me/player/devices", "");
-  if (res.httpCode == 200) {
-    webServer.send(200, "application/json", res.payload);
-  } else {
-    webServer.send(res.httpCode > 0 ? res.httpCode : 500, "application/json", "{\"devices\":[]}");
-  }
-}
-
-void handleApiSelectDevice() {
-  if (!webServer.hasArg("plain")) {
-    webServer.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing body\"}");
-    return;
-  }
-  DynamicJsonDocument doc(512);
-  if (deserializeJson(doc, webServer.arg("plain"))) {
-    webServer.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Bad JSON\"}");
-    return;
-  }
-  String newId = doc["id"].as<String>();
-  String newName = doc["name"].as<String>();
-
-  if (!newId.isEmpty()) {
-    currentDeviceId = newId;
-    if (!newName.isEmpty()) {
-      deviceName = newName;
-      preferences.putString("device_name", newName);
-    }
-    LOG("[Web] Target speaker switched to: " + deviceName + " (" + currentDeviceId + ")");
-
-    // Transfer active playback to the newly selected speaker
-    String transferBody = "{\"device_ids\":[\"" + newId + "\"],\"play\":true}";
-    spotify.CallAPI("PUT", "https://api.spotify.com/v1/me/player", transferBody);
-
-    webServer.send(200, "application/json", "{\"status\":\"ok\",\"deviceId\":\"" + currentDeviceId + "\",\"deviceName\":\"" + deviceName + "\"}");
-  } else {
-    webServer.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Device ID empty\"}");
-  }
-}
-
-void handleApiClearScreen() {
-  digitalWrite(SS_PIN, HIGH);
-  tft.fillScreen(ILI9341_BLACK);
-  lastScreenActivityMillis = 0;
-  LOG("[Web] TFT screen cleared via web dashboard");
-  webServer.send(200, "application/json", "{\"status\":\"ok\"}");
-}
-
-void handleApiShowImage() {
-  LOG("[Web] Show last image requested via web dashboard");
-  showLastImage();
-  webServer.send(200, "application/json", "{\"status\":\"ok\"}");
-}
-
-void handleApiShowInfo() {
-  LOG("[Web] Show device info requested via web dashboard");
-  showDeviceInfoScreen();
-  webServer.send(200, "application/json", "{\"status\":\"ok\"}");
-}
-
-void handleApiResetRfid() {
-  LOG("[Web] Card reader reset requested via web dashboard");
-  bool ok = checkAndRecoverMFRC522(true);
-  webServer.send(200, "application/json", "{\"status\":\"" + String(ok ? "ok" : "error") + "\"}");
-}
-
-void handleApiRefreshToken() {
-  bool ok = spotify.EnsureTokenFresh();
-  webServer.send(200, "application/json", "{\"status\":\"" + String(ok ? "ok" : "error") + "\"}");
-}
-
-void handleApiStatus() {
-  unsigned long sec = millis() / 1000;
-  unsigned long days = sec / 86400; sec %= 86400;
-  unsigned long hrs = sec / 3600; sec %= 3600;
-  unsigned long mins = sec / 60; sec %= 60;
-  char uptimeStr[32];
-  sprintf(uptimeStr, "%lud %luh %lum %lus", days, hrs, mins, sec);
-
-  uint32_t freeHeap = ESP.getFreeHeap();
-  uint32_t totalHeap = ESP.getHeapSize();
-  float heapUsedPct = 100.0f - ((float)freeHeap / (float)totalHeap * 100.0f);
-
-  byte rfidVer = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-
-  DynamicJsonDocument doc(512);
-  doc["uptime"] = uptimeStr;
-  doc["cpu_load"] = serialized(String(cpuLoadPercent, 1));
-  doc["cpu_freq_mhz"] = ESP.getCpuFreqMHz();
-  doc["free_heap"] = freeHeap;
-  doc["total_heap"] = totalHeap;
-  doc["heap_used_pct"] = serialized(String(heapUsedPct, 1));
-  doc["wifi_ssid"] = ssid;
-  doc["wifi_rssi"] = WiFi.RSSI();
-  doc["ip"] = WiFi.localIP().toString();
-  doc["device_name"] = deviceName;
-  doc["device_id"] = currentDeviceId;
-  doc["token_valid"] = spotify.IsTokenValid();
-  doc["volume"] = currentVolume;
-  doc["is_paused"] = isPaused;
-  doc["rfid_ok"] = (rfidVer != 0x00 && rfidVer != 0xFF);
-  char rfidHex[8];
-  sprintf(rfidHex, "0x%02X", rfidVer);
-  doc["rfid_version"] = rfidHex;
-
-  String out;
-  serializeJson(doc, out);
-  webServer.send(200, "application/json", out);
-}
-
-void handleWebRoot() {
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
-                "<title>Spotify RFID Player</title>"
-                "<style>"
-                "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #121212; color: #fff; padding: 16px; max-width: 650px; margin: 0 auto; }"
-                "h1 { color: #1DB954; font-size: 24px; margin: 0 0 16px 0; display: flex; justify-content: space-between; align-items: center; }"
-                ".grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }"
-                ".stat-card { background: #282828; padding: 12px; border-radius: 10px; text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,0.4); }"
-                ".stat-val { font-size: 16px; font-weight: bold; color: #1DB954; margin-top: 4px; }"
-                ".stat-lbl { font-size: 11px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }"
-                ".card { background: #282828; padding: 18px; border-radius: 12px; margin-bottom: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }"
-                "select, input[type=text] { width: 100%; padding: 12px; margin: 8px 0; box-sizing: border-box; background: #3e3e3e; border: 1px solid #555; color: #fff; border-radius: 8px; font-size: 14px; }"
-                "input[type=submit], .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: #1DB954; color: white; border: none; padding: 9px 15px; border-radius: 20px; font-weight: bold; cursor: pointer; font-size: 13px; margin: 4px 2px; text-decoration: none; transition: background 0.2s; }"
-                ".btn:hover { filter: brightness(1.1); }"
-                ".btn-secondary { background: #444; }"
-                ".btn-control { background: #1e6091; }"
-                ".btn-danger { background: #b7094c; }"
-                ".status { padding: 10px; border-radius: 8px; margin-top: 10px; font-weight: bold; text-align: center; font-size: 13px; }"
-                ".ok { background: #1b4332; color: #74c69d; }"
-                ".err { background: #49111c; color: #ff758f; }"
-                "pre { background: #181818; color: #74c69d; padding: 12px; border-radius: 8px; height: 260px; overflow-y: auto; font-family: monospace; font-size: 11px; white-space: pre-wrap; line-height: 1.4; border: 1px solid #333; margin: 10px 0 0 0; }"
-                "</style></head><body>"
-                "<h1><span>Spotify RFID Player</span><span id='tokenPill' style='font-size:12px; padding:4px 10px; border-radius:12px; background:#1b4332; color:#74c69d;'>CONNECTED</span></h1>"
-                
-                "<div class='grid'>"
-                "<div class='stat-card'><div class='stat-lbl'>CPU Load</div><div class='stat-val' id='valCpu'>--%</div></div>"
-                "<div class='stat-card'><div class='stat-lbl'>Free RAM</div><div class='stat-val' id='valRam'>-- KB</div></div>"
-                "<div class='stat-card'><div class='stat-lbl'>Card Reader</div><div class='stat-val' id='valRfid'>--</div></div>"
-                "<div class='stat-card'><div class='stat-lbl'>Wi-Fi Signal</div><div class='stat-val' id='valWifi'>-- dBm</div></div>"
-                "<div class='stat-card'><div class='stat-lbl'>Uptime</div><div class='stat-val' id='valUptime'>--</div></div>"
-                "</div>"
-
-                "<div class='card'>"
-                "<h3 style='margin-top:0;'>Target Speaker</h3>"
-                "<p style='margin:4px 0 10px 0;'><strong>Current:</strong> <span id='curSpeaker' style='color:#1DB954; font-weight:bold;'>" + deviceName + "</span></p>"
-                "<label style='font-size:12px; color:#aaa;'>Select from detected Spotify Connect speakers:</label>"
-                "<select id='speakerSelect'><option value=''>Loading speakers...</option></select>"
-                "<div style='margin-top:8px;'>"
-                "<button class='btn btn-control' onclick='switchSpeaker()'>Switch Speaker</button>"
-                "<button class='btn btn-secondary' onclick='loadDevices()'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z'/></svg> Refresh List</button>"
-                "</div></div>"
-
-                "<div class='card'>"
-                "<h3 style='margin-top:0;'>Player & Volume Controls</h3>"
-                "<div>"
-                "<button class='btn btn-control' onclick='apiPost(\"/api/playpause\")'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M4 5v14l9-7-9-7zm11 0h3v14h-3V5z'/></svg> Play/Pause</button>"
-                "<button class='btn btn-control' onclick='apiPost(\"/api/next\")'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z'/></svg> Next Track</button>"
-                "<button class='btn btn-secondary' onclick='apiPost(\"/api/voldown\")'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M7 9v6h4l5 5V4l-5 5H7z'/></svg> Vol &minus;</button>"
-                "<button class='btn btn-secondary' onclick='apiPost(\"/api/volup\")'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z'/></svg> Vol &#43;</button>"
-                "</div>"
-                "<div style='margin-top:10px; padding-top:10px; border-top:1px solid #3a3a3a;'>"
-                "<button class='btn btn-secondary' onclick='apiPost(\"/api/clear_screen\")'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M19 4h-3.5l-1-1h-5l-1 1H5v2h14M6 19a2 2 0 002 2h8a2 2 0 002-2V7H6v12z'/></svg> Clear Display</button>"
-                "<button class='btn btn-secondary' onclick='apiPost(\"/api/show_image\")'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z'/></svg> Show Last Image</button>"
-                "<button class='btn btn-secondary' onclick='apiPost(\"/api/show_info\")'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z'/></svg> Device Info</button>"
-                "<button class='btn btn-secondary' onclick='apiPost(\"/api/reset_rfid\")'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z'/></svg> Reset Card Reader</button>"
-                "<button class='btn btn-secondary' onclick='apiPost(\"/api/refresh_token\")'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M12.65 10C11.83 7.67 9.61 6 7 6c-3.31 0-6 2.69-6 6s2.69 6 6 6c2.61 0 4.83-1.67 5.65-4H17v4h4v-4h2v-4H12.65zM7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z'/></svg> Refresh Token</button>"
-                "<button class='btn btn-danger' onclick='restartDevice()'><svg width='13' height='13' viewBox='0 0 24 24' fill='currentColor'><path d='M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z'/></svg> Reboot ESP32</button>"
-                "</div></div>"
-
-                "<div class='card'>"
-                "<div style='display:flex; justify-content:space-between; align-items:center;'>"
-                "<h3 style='margin:0;'>Live Console Logs</h3>"
-                "<span style='font-size:11px; color:#aaa;'>Auto-refreshing</span>"
-                "</div>"
-                "<pre id='logBox'>Loading logs...</pre>"
-                "</div>"
-
-                "<div class='card'>"
-                "<h3 style='margin-top:0;'>Manual Token Update</h3>"
-                "<p style='color:#aaa;font-size:12px; margin:4px 0 8px 0;'>Paste new Spotify Refresh Token if ever revoked:</p>"
-                "<form action='/update' method='POST'>"
-                "<input type='text' name='token' placeholder='Paste refresh token' required>"
-                "<input type='submit' value='Save to Flash'>"
-                "</form></div>"
-
-                "<script>"
-                "function fetchStatus() {"
-                "  fetch('/api/status').then(r => r.json()).then(d => {"
-                "    document.getElementById('valCpu').innerText = d.cpu_load + '% (' + d.cpu_freq_mhz + 'MHz)';"
-                "    document.getElementById('valRam').innerText = Math.round(d.free_heap/1024) + ' KB (' + d.heap_used_pct + '% used)';"
-                "    var rfidEl = document.getElementById('valRfid');"
-                "    if (rfidEl) {"
-                "      rfidEl.innerText = d.rfid_ok ? ('ONLINE (' + d.rfid_version + ')') : 'OFFLINE';"
-                "      rfidEl.style.color = d.rfid_ok ? '#74c69d' : '#ff758f';"
-                "    }"
-                "    document.getElementById('valWifi').innerText = d.wifi_ssid + ' (' + d.wifi_rssi + ' dBm)';"
-                "    document.getElementById('valUptime').innerText = d.uptime;"
-                "    document.getElementById('curSpeaker').innerText = d.device_name + (d.device_id ? '' : ' (sleeping/unlinked)');"
-                "    var pill = document.getElementById('tokenPill');"
-                "    if (d.token_valid) {"
-                "      pill.style.background = '#1b4332'; pill.style.color = '#74c69d'; pill.innerText = 'AUTHENTICATED';"
-                "    } else {"
-                "      pill.style.background = '#49111c'; pill.style.color = '#ff758f'; pill.innerText = 'TOKEN EXPIRED';"
-                "    }"
-                "  }).catch(() => {});"
-                "}"
-                "function fetchLogs() {"
-                "  fetch('/api/logs').then(r => r.text()).then(t => {"
-                "    var b = document.getElementById('logBox');"
-                "    var atBottom = (b.scrollHeight - b.scrollTop - b.clientHeight < 60);"
-                "    b.innerText = t;"
-                "    if (atBottom) b.scrollTop = b.scrollHeight;"
-                "  }).catch(() => {});"
-                "}"
-                "function loadDevices() {"
-                "  fetch('/api/devices').then(r => r.json()).then(d => {"
-                "    var sel = document.getElementById('speakerSelect');"
-                "    sel.innerHTML = '';"
-                "    var list = d.devices || [];"
-                "    if (list.length === 0) {"
-                "      sel.innerHTML = '<option value=\"\">(No active speakers found - wake with \"Alexa, Spotify Connect\")</option>';"
-                "      return;"
-                "    }"
-                "    list.forEach(dev => {"
-                "      var opt = document.createElement('option');"
-                "      opt.value = JSON.stringify({id: dev.id, name: dev.name});"
-                "      opt.innerText = dev.name + ' (' + dev.type + ')' + (dev.is_active ? ' [Active]' : '');"
-                "      sel.appendChild(opt);"
-                "    });"
-                "  }).catch(() => {});"
-                "}"
-                "function switchSpeaker() {"
-                "  var sel = document.getElementById('speakerSelect');"
-                "  if (!sel.value) return;"
-                "  var val = JSON.parse(sel.value);"
-                "  fetch('/api/select_device', {"
-                "    method: 'POST',"
-                "    headers: {'Content-Type': 'application/json'},"
-                "    body: JSON.stringify(val)"
-                "  }).then(r => r.json()).then(res => {"
-                "    alert('Target speaker switched to: ' + res.deviceName);"
-                "    fetchStatus();"
-                "    loadDevices();"
-                "  });"
-                "}"
-                "function apiPost(url) {"
-                "  fetch(url, {method:'POST'}).then(() => { fetchStatus(); fetchLogs(); });"
-                "}"
-                "function restartDevice() {"
-                "  if (confirm('Reboot ESP32?')) {"
-                "    fetch('/api/restart', {method:'POST'});"
-                "    alert('Rebooting... Page will reload in 5 seconds.');"
-                "    setTimeout(() => location.reload(), 5000);"
-                "  }"
-                "}"
-                "var pollTimer = null;"
-                "function pollCycle() { fetchStatus(); fetchLogs(); }"
-                "function startPolling() { if (!pollTimer) pollTimer = setInterval(pollCycle, 3000); }"
-                "function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }"
-                "document.addEventListener('visibilitychange', () => {"
-                "  if (document.hidden) stopPolling();"
-                "  else { pollCycle(); startPolling(); }"
-                "});"
-                "pollCycle();"
-                "loadDevices();"
-                "startPolling();"
-                "</script></body></html>";
-  webServer.send(200, "text/html; charset=utf-8", html);
-}
-
-void handleWebUpdate() {
-  String newToken = "";
-  if (webServer.hasArg("token")) {
-    newToken = webServer.arg("token");
-  } else if (webServer.hasArg("plain")) {
-    DynamicJsonDocument doc(1024);
-    if (!deserializeJson(doc, webServer.arg("plain"))) {
-      newToken = doc["token"].as<String>();
-    }
-  }
-
-  newToken.trim();
-  if (newToken.isEmpty()) {
-    webServer.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Token is empty\"}");
-    return;
-  }
-
-  LOG("[Web] Received new refresh token via HTTP: " + newToken.substring(0, 10) + "...");
-  preferences.putString("ref_token", newToken);
-  spotify.SetRefreshToken(newToken);
-
-  if (spotify.EnsureTokenFresh()) {
-    currentDeviceId = spotify.GetDevices();
-    LOG("[Web] Token refreshed successfully! New Device ID: " + currentDeviceId);
-    String resHtml = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
-                     "<style>body{background:#121212;color:#fff;font-family:sans-serif;padding:30px;text-align:center;}"
-                     ".btn{background:#1DB954;color:#fff;padding:14px 28px;border-radius:30px;text-decoration:none;font-weight:bold;display:inline-block;margin-top:20px;}"
-                     "</style></head><body>"
-                     "<h1 style='color:#1DB954;'>Token Updated!</h1>"
-                     "<p>Your Spotify RFID player is re-authenticated and ready to play.</p>"
-                     "<a class='btn' href='/'>Back to Status</a></body></html>";
-    if (webServer.hasArg("plain")) {
-      webServer.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Token updated and authenticated!\"}");
-    } else {
-      webServer.send(200, "text/html; charset=utf-8", resHtml);
-    }
-  } else {
-    LOG("[Web] Token update failed: Spotify rejected the new token.");
-    if (webServer.hasArg("plain")) {
-      webServer.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Spotify rejected token\"}");
-    } else {
-      webServer.send(400, "text/html; charset=utf-8", "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><h1 style='color:red;'>Update Failed</h1><p>Spotify rejected this refresh token. Check Telnet/Serial logs.</p><a href='/'>Try again</a></body></html>");
-    }
-  }
-}
-void connectWifi() { LOG("[Main] Connecting to Wi-Fi..."); WiFi.begin(ssid, pass); unsigned long start = millis(); while (WiFi.status() != WL_CONNECTED && millis() - start < 30000) { delay(500); Serial.print('.'); } if (WiFi.status() == WL_CONNECTED) { LOG("\n[Main] Wi-Fi connected: " + WiFi.localIP().toString()); } else { LOG("\n[Main] Wi-Fi FAILED"); } }
-void ensureWifiConnected() { static unsigned long lastTry = 0; if (WiFi.status() == WL_CONNECTED) return; unsigned long now = millis(); if (now - lastTry > 10000) { LOG("[Main] Wi-Fi lost - retrying connection to " + String(ssid) + "..."); WiFi.disconnect(); WiFi.begin(ssid, pass); lastTry = now; } }
-void logError(const String& msg, int code) { LOG("[Error] " + msg + " (HTTP " + String(code) + ")"); }
-
-
-// --- NEW: NDEF Tag Reading Logic ---
-// This function completely replaces the old readNFCTag, readFromCard, and authenticateBlock functions.
-void readNFCTag() {
-    digitalWrite(TFT_CS, HIGH); // Ensure TFT is deselected on shared SPI bus
-    if (!nfc.tagPresent()) { return; }
-    NfcTag tag = nfc.read();
-    LOG("[Main] Tag detected! UID: " + tag.getUidString());
-    if (!tag.hasNdefMessage()) { LOG("[NFC] Tag is not NDEF formatted."); delay(2000); return; }
-    
-    NdefMessage message = tag.getNdefMessage();
-    String finalUri = "";
-
-    for (int i = 0; i < message.getRecordCount(); i++) {
-        NdefRecord record = message.getRecord(i);
-        // We only care about Text records
-        if (record.getTnf() == NdefRecord::TNF_WELL_KNOWN && record.getTypeLength() == 1 && record.getType()[0] == 'T') {
-            int payloadLength = record.getPayloadLength();
-            const byte* payload = record.getPayload();
-            int langCodeLength = payload[0] & 0x3F;
-            int textLength = payloadLength - (1 + langCodeLength);
-            char text[textLength + 1];
-            memcpy(text, &payload[1 + langCodeLength], textLength);
-            text[textLength] = '\0';
-            String rawUri = String(text);
-            LOG("[NFC] Found Text Record: " + rawUri);
-
-            // Clean the URI to get a standard spotify: format
-            String spotifyUri = rawUri;
-            int questionMarkIndex = spotifyUri.indexOf('?');
-            if (questionMarkIndex != -1) {
-                spotifyUri = spotifyUri.substring(0, questionMarkIndex);
-            }
-             if (spotifyUri.startsWith("https://open.spotify.com/")) {
-                spotifyUri.replace("https://open.spotify.com/", "spotify:");
-                int slashIndex = spotifyUri.indexOf('/');
-                if (slashIndex != -1) {
-                    spotifyUri.setCharAt(slashIndex, ':');
-                }
-            }
-            if (spotifyUri.startsWith("spotify:")) { finalUri = spotifyUri; break; }
-        }
-    }
-
-    if (finalUri.length() > 0) {
-        LOG("[Main] URI ready for playback: " + finalUri);
-        if (finalUri.startsWith("spotify:artist:")) {
-            playRandomAlbumFromArtist(finalUri);
-        } else {
-            playSpotifyUri(finalUri);
-        }
-    } else {
-        LOG("[Main] No valid Spotify URI or URL found on this card.");
-    }
-    delay(3000); // Wait a few seconds before allowing another scan
-}
-
-
-// --- Spotify playback helpers ---
-void playSpotifyUri(const String& uri) {
-  LOG("[Main] playSpotifyUri -> " + uri);
-  disableShuffle();
-  for (int attempt = 1; attempt <= 3; attempt++) {
-    int code = spotify.Play(uri);
-    if (code == 200 || code == 204) {
-      LOG("[Main] Playback OK");
-      showAlbumArt();
-      return;
-    }
-    if (code == 404) { LOG("[Main] Device not found (404). Clearing stored ID to force re-fetch on next play."); currentDeviceId = ""; }
-    if (code == 401 || code == 404) {
-      LOG("[Main] Resetting state (err " + String(code) + ")");
-      spotify.ResetState();
-    } else {
-      logError("playSpotifyUri", code);
-    }
-    delay(2000);
-  }
-  LOG("[Main] Giving up on playSpotifyUri");
-}
-
-void disableShuffle() {
-  spotify.EnsureTokenFresh();
-  if (currentDeviceId.length() == 0) {
-    LOG("[Main] No stored Device ID. Fetching device list...");
-    currentDeviceId = spotify.GetDevices();
-    LOG("[Main] Stored new Device ID: " + currentDeviceId);
-  }
-  if (currentDeviceId.isEmpty()) { LOG("[Main] No active device found for disableShuffle"); return; }
-  String url = "https://api.spotify.com/v1/me/player/shuffle?state=false&device_id=" + currentDeviceId;
-  HttpResult r = spotify.CallAPI("PUT", url, "{}");
-  if (r.httpCode == 200 || r.httpCode == 204) { LOG("[Main] Shuffle OFF"); } 
-  else { logError("disableShuffle", r.httpCode); }
-}
-
-// In your main .ino file, replace the existing function with this one.
-
-void playRandomAlbumFromArtist(const String& artistUri) {
-  // Static variables to remember the current playlist between function calls
-  static String lastArtistId;
-  static std::vector<int> albumPlaylistIndices;
-  static size_t playlistIndex = 0;
-  String artistId = artistUri.substring(15);
-
-  // If the artist is new, build a shuffled list of their album INDICES
-  if (artistId != lastArtistId) {
-    LOG("[Main] New artist detected. Building shuffled index for " + artistId);
-    albumPlaylistIndices.clear();
-
-    String countUrl = "https://api.spotify.com/v1/artists/" + artistId + "/albums?include_groups=album,single&limit=1";
-    HttpResult countResult = spotify.CallAPI("GET", countUrl, "");
-    if (countResult.httpCode != 200) {
-      logError("fetch album count", countResult.httpCode);
-      return;
-    }
-    DynamicJsonDocument countDoc(1024);
-    deserializeJson(countDoc, countResult.payload);
-    int totalAlbums = countDoc["total"];
-
-    if (totalAlbums == 0) {
-      LOG("[Main] No albums found for this artist.");
-      return;
-    }
-    
-    // --- THIS IS THE SPECIAL CASE LOGIC THAT WAS MISSING ---
-    int playlistSize = totalAlbums;
-    int startOffset = 0;
-    // Check for the specific artist IDs and adjust the playlist size and offset
-    if ((artistId == "1l6d0RIxTL3JytlLGvWzYe" || artistId == "3t2iKODSDyzoDJw7AsD99u") && totalAlbums > 60) {
-      LOG("[Main] Special artist: Creating playlist from the 60 oldest albums.");
-      playlistSize = 60;
-      startOffset = totalAlbums - 60; // Start from the older albums
-    } else {
-      LOG("[Main] Building playlist with all " + String(playlistSize) + " album indices.");
-    }
-
-    albumPlaylistIndices.resize(playlistSize);
-    for (int i = 0; i < playlistSize; i++) {
-      albumPlaylistIndices[i] = startOffset + i;
-    }
-    // --- END OF SPECIAL CASE LOGIC ---
-    
-    randomSeed(micros());
-    for (int i = albumPlaylistIndices.size() - 1; i > 0; --i) {
-      int j = random(0, i + 1);
-      std::swap(albumPlaylistIndices[i], albumPlaylistIndices[j]);
-    }
-    
-    playlistIndex = 0;
-    lastArtistId = artistId;
-    LOG("[Main] Shuffled index created successfully.");
-  }
-
-  if (playlistIndex >= albumPlaylistIndices.size()) {
-    LOG("[Main] Playlist exhausted. Reshuffling index...");
-    randomSeed(micros());
-    for (int i = albumPlaylistIndices.size() - 1; i > 0; --i) {
-      int j = random(0, i + 1);
-      std::swap(albumPlaylistIndices[i], albumPlaylistIndices[j]);
-    }
-    playlistIndex = 0;
-  }
-
-  String albumUri = "";
-  String albumName = "";
-  
-  // Get the album URI from the pre-shuffled list
-  int randomOffset = albumPlaylistIndices[playlistIndex];
-  playlistIndex++;
-  
-  LOG("[Main] Playing album at index #" + String(randomOffset) + " (track " + String(playlistIndex) + " of " + String(albumPlaylistIndices.size()) + ")");
-  String albumUrl = "https://api.spotify.com/v1/artists/" + artistId + "/albums?include_groups=album,single&limit=1&offset=" + String(randomOffset);
-  HttpResult albumResult = spotify.CallAPI("GET", albumUrl, "");
-  if (albumResult.httpCode == 200) {
-    DynamicJsonDocument albumDoc(2048);
-    deserializeJson(albumDoc, albumResult.payload);
-    albumUri = albumDoc["items"][0]["uri"].as<String>();
-    albumName = albumDoc["items"][0]["name"].as<String>();
-  }
-
-  if (albumUri.length() > 0) {
-    LOG("[Main] Now playing: " + albumName);
-    playSpotifyUri(albumUri);
-  } else {
-    LOG("[Main] Failed to find a matching album for this tap.");
-  }
-}
-
-
-void showAlbumArt() {
-  // 1) GET currently-playing JSON
-  HttpResult now = spotify.CallAPI(
-    "GET",
-    "https://api.spotify.com/v1/me/player/currently-playing",
-    ""
-  );
-  if (now.httpCode != 200) {
-    LOG("[Main] couldn't get now-playing (HTTP " + String(now.httpCode) + ")");
-    return;
-  }
-
-  // 2) Parse out the image URL
-  DynamicJsonDocument doc(16 * 1024);
-  deserializeJson(doc, now.payload);
-  const char* url = doc["item"]["album"]["images"][1]["url"];
-  LOG("[Main] cover URL: " + String(url));
-
-  // 3) NEW: Ask the Spotify client to download the JPEG into our buffer
-  size_t count = spotify.DownloadFile(String(url), jpgBuf, MAX_JPEG);
-  
-  LOG("[Main] Read " + String(count) + " bytes for album art");
-  if (count == 0) {
-      LOG("[Main] Cover download failed");
-      return;
-  }
-  lastJpgCount = count;
-  
-  // 4) Decode and Render
-  digitalWrite(SS_PIN, HIGH); // Deselect MFRC522 while TFT draws on SPI bus
-  tft.fillScreen(ILI9341_BLACK);
-  JpegDec.abort();
-  if (!JpegDec.decodeArray(jpgBuf, count)) {
-    LOG("[Main] JPEG decode failed");
-    return;
-  }
-
-  renderJPEG(0, -30);
-  lastScreenActivityMillis = millis();
-}
-
-void showLastImage() {
-  if (lastJpgCount > 0) {
-    LOG("[Display] Rendering cached album art from RAM (" + String(lastJpgCount) + " bytes)...");
-    digitalWrite(SS_PIN, HIGH); // Deselect MFRC522 while TFT draws on SPI bus
-    tft.fillScreen(ILI9341_BLACK);
-    JpegDec.abort();
-    if (JpegDec.decodeArray(jpgBuf, lastJpgCount)) {
-      renderJPEG(0, -30);
-      lastScreenActivityMillis = millis();
-      LOG("[Display] Cached album art displayed successfully");
-      return;
-    } else {
-      LOG("[Display] Cached JPEG decode failed, falling back to Spotify API...");
-    }
-  } else {
-    LOG("[Display] No cached image in RAM, fetching current album art from Spotify...");
-  }
-  showAlbumArt();
-}
-
-void showDeviceInfoScreen() {
-  digitalWrite(SS_PIN, HIGH); // Deselect MFRC522 while TFT draws on SPI bus
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setTextColor(ILI9341_GREEN);
-  tft.setTextSize(2);
-  tft.setCursor(15, 35);
-  tft.println("Spotify RFID Player");
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setTextSize(2);
-  tft.setCursor(15, 75);
-  tft.println("IP: " + WiFi.localIP().toString());
-  tft.setTextSize(1);
-  tft.setCursor(15, 115);
-  tft.println("Web: http://spotify-player.local/");
-  tft.setCursor(15, 135);
-  tft.println("WiFi: " + String(ssid) + " (" + String(WiFi.RSSI()) + " dBm)");
-  tft.setCursor(15, 165);
-  tft.setTextColor(ILI9341_CYAN);
-  tft.println("Ready - Tap RFID card to play");
-  lastScreenActivityMillis = millis();
-}
-
-void renderJPEG(int xPos, int yPos) {
-  while (JpegDec.read()) {
-    uint16_t *pImg = JpegDec.pImage;
-    int mcu_w = JpegDec.MCUWidth;
-    int mcu_h = JpegDec.MCUHeight;
-    int mcu_x_offset = JpegDec.MCUx * mcu_w;
-    int mcu_y_offset = JpegDec.MCUy * mcu_h;
-    for (int y = 0; y < mcu_h; y++) {
-      for (int x = 0; x < mcu_w; x++) {
-        tft.drawPixel(xPos + mcu_x_offset + x, yPos + mcu_y_offset + y, pImg[y * mcu_w + x]);
-      }
-    }
-  }
+  delay(5);
 }

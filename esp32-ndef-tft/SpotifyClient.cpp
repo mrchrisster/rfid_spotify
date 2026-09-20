@@ -1,370 +1,240 @@
-#include <WiFi.h>
 #include "SpotifyClient.h"
-#include <HTTPClient.h>
-#include <base64.h>
+#include "SafeNdef.h"
+#include "Reliability.h"
+#include <WiFi.h>
 #include <ArduinoJson.h>
+#include <base64.h>
+#include <time.h>
+#include <new>
 
-// Route LOG macro to logMessage so logs appear in both Serial and Telnet
-__attribute__((weak)) void logMessage(const String& msg) {
-    Serial.println(msg);
+// Mozilla trust bundle embedded by the pinned ESP32 core; never disable verification.
+extern const uint8_t bundleStart[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t bundleEnd[] asm("_binary_x509_crt_bundle_end");
+namespace {
+constexpr size_t MaxJson = 24 * 1024;
+class BoundedSink : public Stream {
+  uint8_t* buffer;
+  size_t capacity;
+  uint32_t started = millis();
+public:
+  size_t count = 0;
+  bool failed = false;
+  BoundedSink(uint8_t* buffer, size_t capacity) : buffer(buffer), capacity(capacity) {}
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+  size_t write(uint8_t b) override { return write(&b, 1); }
+  size_t write(const uint8_t* data, size_t size) override {
+    if (failed || size > capacity - count || millis() - started > 10000) { failed = true; return 0; }
+    memcpy(buffer + count, data, size); count += size; return size;
+  }
+};
+bool readBody(HTTPClient& http, String& body) {
+  if (http.getSize() > int(MaxJson)) return false;
+  size_t capacity = http.getSize() >= 0 ? size_t(http.getSize()) : MaxJson;
+  auto* bytes = static_cast<uint8_t*>(malloc(capacity + 1));
+  if (!bytes) return false;
+  BoundedSink sink(bytes, capacity);
+  int read = http.writeToStream(&sink);
+  bool ok = read >= 0 && !sink.failed && (http.getSize() < 0 || sink.count == size_t(http.getSize()));
+  if (ok) { bytes[sink.count] = 0; body = reinterpret_cast<char*>(bytes); ok = body.length() == sink.count; }
+  free(bytes); return ok;
 }
-
-#ifndef LOG
-#define LOG(msg) logMessage(msg)
-#endif
-
-SpotifyClient::SpotifyClient(String clientId, String clientSecret, String deviceName, String refreshToken) {
-    this->clientId = clientId;
-    this->clientSecret = clientSecret;
-    this->deviceName = deviceName;
-    this->refreshToken = refreshToken;
-
-    client.setInsecure(); // Bypass cert expiry & NTP check for stable IoT HTTPS
-    tokenValid = false;
-    deviceId = "";
-    lastTokenRefresh = 0;
-    // tokenRefreshInterval is initialized to a default of 3600000 (1 hour) in the header
+String encoded(const String& value) {
+  static const char hex[] = "0123456789ABCDEF";
+  String result;
+  for (size_t i = 0; i < value.length(); ++i) {
+    uint8_t c = value[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') result += char(c);
+    else { result += '%'; result += hex[c >> 4]; result += hex[c & 15]; }
+  }
+  return result;
 }
-
-void SpotifyClient::SetRefreshTokenCallback(RefreshTokenCallback callback) {
-    this->onTokenRotated = callback;
+bool success(int code) { return code == 200 || code == 204; }
 }
-
-void SpotifyClient::FetchToken() {
-    tokenValid = false; // Mark token invalid before fetching
-    LOG("[SpotifyClient] Fetching new token...");
-
-    String body = "grant_type=refresh_token&refresh_token=" + refreshToken;
-    String authorizationRaw = clientId + ":" + clientSecret;
-    String authorization = base64::encode(authorizationRaw);
-
-    const int maxAttempts = 3;
-    bool success = false;
-
-    for (int attempts = 0; attempts < maxAttempts; attempts++) {
-        client.stop();        // Reset any existing SSL socket
-        client.setInsecure(); // Ensure TLS verification doesn't fail on NTP/cert rotation
-
-        HTTPClient http;
-        http.begin(client, "https://accounts.spotify.com/api/token");
-        http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-        http.addHeader("Authorization", "Basic " + authorization);
-
-        int httpCode = http.POST(body);
-
-        if (httpCode > 0) {
-            String returnedPayload = http.getString();
-            LOG("[SpotifyClient] Token fetch response: " + returnedPayload);
-
-            if (httpCode == 200) {
-                DynamicJsonDocument doc(2048);
-                DeserializationError error = deserializeJson(doc, returnedPayload);
-                if (!error) {
-                    accessToken = doc["access_token"].as<String>();
-
-                    // Auto-Rolling Refresh Token: If Spotify issued a new refresh token, persist it
-                    if (doc.containsKey("refresh_token")) {
-                        String newRefreshToken = doc["refresh_token"].as<String>();
-                        if (!newRefreshToken.isEmpty() && newRefreshToken != refreshToken) {
-                            LOG("[SpotifyClient] Rolling refresh token received from Spotify!");
-                            refreshToken = newRefreshToken;
-                            if (onTokenRotated != nullptr) {
-                                onTokenRotated(newRefreshToken);
-                            }
-                        }
-                    }
-
-                    int expiresIn = doc["expires_in"] | 3600;
-                    tokenRefreshInterval = (expiresIn > 300 ? expiresIn - 300 : expiresIn) * 1000UL;
-                    lastTokenRefresh = millis();
-                    tokenValid = true;
-                    LOG("[SpotifyClient] Token refreshed successfully. Valid for " + String(expiresIn) + " seconds.");
-                } else {
-                    LOG("[SpotifyClient] JSON parse error: " + String(error.c_str()));
-                    tokenValid = false;
-                }
-
-                success = true;
-                http.end();
-                break;
-            } else {
-                LOG("[SpotifyClient] Failed to fetch token. HTTP Code: " + String(httpCode));
-                LOG("[SpotifyClient] Response: " + returnedPayload);
-                if (httpCode == 400 && returnedPayload.indexOf("invalid_grant") != -1) {
-                    // Truly expired or revoked token
-                    LOG("\n==================================================================");
-                    LOG("[SpotifyClient] *** SPOTIFY REFRESH TOKEN EXPIRED OR REVOKED ***");
-                    LOG("[SpotifyClient] To renew without re-flashing your ESP32:");
-                    LOG("[SpotifyClient] 1. Run 'python3 renew_token.py' on your Mac, OR");
-                    LOG("[SpotifyClient] 2. Open http://" + WiFi.localIP().toString() + "/ in your browser");
-                    LOG("[SpotifyClient]    and paste a fresh token.");
-                    LOG("==================================================================\n");
-                    tokenValid = false;
-                    http.end();
-                    return;
-                }
-            }
-        } else {
-            LOG("[SpotifyClient] Network error: " + String(http.errorToString(httpCode)) + " (" + String(httpCode) + ")");
-        }
-
-        http.end();
-        LOG("[SpotifyClient] Retrying in 2 seconds...");
-        delay(2000);
-    }
-
-    if (!success) {
-        LOG("[SpotifyClient] Refresh token attempt failed due to network connectivity. Will retry later.");
-        tokenValid = false;
-    }
+SpotifyClient::SpotifyClient(String id, String secret, String speaker, String token)
+ : clientId(id), clientSecret(secret), deviceName(speaker), refreshToken(token) {}
+void SpotifyClient::SetRefreshToken(const String& token, bool usePkce) {
+  pkce = usePkce; persistencePending = false;
+  refreshToken = token; accessToken = ""; tokenValid = false; revoked = false;
 }
-
-void SpotifyClient::SetRefreshToken(String newRefreshToken) {
-    this->refreshToken = newRefreshToken;
-    this->tokenValid = false;
-    this->lastTokenRefresh = 0;
+void SpotifyClient::SelectDevice(const String& name, const String& id) { deviceName = name; deviceId = id; }
+bool SpotifyClient::IsTokenValid() const { return tokenValid && uint32_t(millis() - refreshedAt) < validFor; }
+uint32_t SpotifyClient::RetryInMs() const {
+  return remainingDelay(millis(), cooldownAt, cooldownFor);
 }
-
-bool SpotifyClient::IsTokenExpired() {
-    // Rollover-safe comparison for token expiration
-    return (millis() - lastTokenRefresh) >= tokenRefreshInterval;
+void SpotifyClient::cooldown(int code, const String& retryAfter) {
+  uint32_t wait = 0;
+  if (code == 429) {
+    unsigned long seconds = strtoul(retryAfter.c_str(), nullptr, 10);
+    if (!seconds) seconds = 30;
+    wait = (seconds > 86400 ? 86400 : seconds) * 1000UL;
+  } else if (code < 0 || code >= 500) wait = 5000;
+  if (wait > RetryInMs()) { cooldownAt = millis(); cooldownFor = wait; }
 }
-
-bool SpotifyClient::EnsureTokenFresh() {
-    // If token is invalid or expired, attempt to refresh
-    if (!tokenValid || IsTokenExpired()) {
-        LOG("[SpotifyClient] Token is invalid or expired. Attempting refresh...");
-        FetchToken();
-        if (!tokenValid || IsTokenExpired()) {
-            LOG("[SpotifyClient] Unable to obtain a fresh token.");
-            return false;
-        }
-    }
-    return true;
+bool SpotifyClient::prepare(HTTPClient& http, const String& url) {
+  if (RetryInMs()) { lastError = 429; return false; }
+  if (WiFi.status() != WL_CONNECTED) { lastError = -1; return false; }
+  if (time(nullptr) < 1700000000) { lastError = -2; return false; }
+  if (!url.startsWith("https://")) { lastError = 400; return false; }
+  client.stop();
+  client.setCACertBundle(bundleStart, bundleEnd - bundleStart);
+  client.setHandshakeTimeout(8);
+  http.setConnectTimeout(3000); http.setTimeout(3000); http.setReuse(false);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) { lastError = -3; return false; }
+  const char* headers[] = {"Retry-After"}; http.collectHeaders(headers, 1);
+  return true;
 }
-
-int SpotifyClient::Play(String context_uri) {
-    LOG("[SpotifyClient] Play()");
-
-    if (!EnsureTokenFresh()) {
-        LOG("[SpotifyClient] Cannot play without a valid token.");
-        return 401; // Unauthorized
+bool SpotifyClient::exchange(const String& candidate, bool replacement) {
+  if (candidate.isEmpty() || candidate.length() > 1024) { lastError = 400; return false; }
+  HTTPClient http;
+  if (!prepare(http, "https://accounts.spotify.com/api/token")) return false;
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  const bool usePkce = !replacement && pkce;
+  if (!usePkce) http.addHeader("Authorization", "Basic " + base64::encode(clientId + ":" + clientSecret));
+  String body = "grant_type=refresh_token&refresh_token=" + encoded(candidate);
+  if (usePkce) body += "&client_id=" + encoded(clientId);
+  int code = http.POST(body);
+  lastError = code; cooldown(code, http.header("Retry-After"));
+  String payload;
+  bool bodyOk = code > 0 && readBody(http, payload);
+  http.end(); client.stop();
+  JsonDocument doc;
+  if (!bodyOk || deserializeJson(doc, payload)) { if (code == 200) lastError = 502; return false; }
+  if (code != 200) {
+    if (!replacement && (doc["error"] == "invalid_grant" || doc["error"] == "invalid_client")) {
+      revoked = true; tokenValid = false;
     }
-
-    if (deviceId.isEmpty()) {
-        LOG("[SpotifyClient] Device ID is empty. Attempting to refresh devices...");
-        GetDevices();
-        if (deviceId.isEmpty()) {
-            LOG("[SpotifyClient] Error: Unable to set deviceId. Aborting playback.");
-            return 404;
-        }
-    }
-
-    String body = "{\"context_uri\":\"" + context_uri + "\",\"offset\":{\"position\":0,\"position_ms\":0}}";
-    String url = "https://api.spotify.com/v1/me/player/play?device_id=" + deviceId;
-    HttpResult result = CallAPI("PUT", url, body);
-
-    if (result.httpCode != 200 && result.httpCode != 204) {
-        LOG("[SpotifyClient] Error: Unexpected HTTP Code: " + String(result.httpCode));
-    }
-    return result.httpCode;
+    logMessage("[Auth] Token request failed (HTTP " + String(code) + ")"); return false;
+  }
+  return acceptTokens(payload, candidate, replacement, usePkce);
 }
-
-int SpotifyClient::Shuffle() {
-    LOG("[SpotifyClient] Shuffle()");
-    if (!EnsureTokenFresh()) {
-        LOG("[SpotifyClient] Cannot shuffle without a valid token.");
-        return 401; 
-    }
-    HttpResult result = CallAPI("PUT", "https://api.spotify.com/v1/me/player/shuffle?state=true&device_id=" + deviceId, "{}");
-    return result.httpCode;
+bool SpotifyClient::acceptTokens(const String& payload, const String& fallback, bool replacement, bool usePkce) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) { lastError = 502; return false; }
+  String access = doc["access_token"] | "";
+  uint32_t seconds = doc["expires_in"] | 0UL;
+  String rotated = doc["refresh_token"] | fallback;
+  if (access.isEmpty() || access.length() > 4096 || !seconds || seconds > 86400 || rotated.isEmpty() || rotated.length() > 1024) {
+    lastError = 502; return false;
+  }
+  bool saved = true;
+  if (replacement || rotated != refreshToken) saved = saveToken && saveToken(rotated, usePkce);
+  // A rotated token may already have invalidated its predecessor; retain it in RAM even if NVS failed.
+  pkce = usePkce; refreshToken = rotated; accessToken = access; tokenValid = true; revoked = false;
+  validFor = (seconds > 300 ? seconds - 300 : seconds) * 1000UL; refreshedAt = millis();
+  persistencePending = !saved;
+  if (!saved) { lastError = 507; logMessage("[Auth] Token valid in RAM but persistence FAILED; do not reboot before retrying save"); return false; }
+  logMessage("[Auth] Token refreshed"); return true;
 }
-
-int SpotifyClient::Next() {
-    LOG("[SpotifyClient] Next()");
-    if (!EnsureTokenFresh()) {
-        LOG("[SpotifyClient] Cannot skip track without a valid token.");
-        return 401; 
+bool SpotifyClient::AuthorizeCode(const String& code, const String& verifier, const String& redirectUri) {
+  if (code.isEmpty() || code.length() > 1024 || verifier.length() != 43 || !redirectUri.startsWith("https://")) {
+    lastError = 400; return false;
+  }
+  HTTPClient http;
+  if (!prepare(http, "https://accounts.spotify.com/api/token")) return false;
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int status = http.POST("grant_type=authorization_code&client_id=" + encoded(clientId) + "&code=" + encoded(code) +
+    "&redirect_uri=" + encoded(redirectUri) + "&code_verifier=" + encoded(verifier));
+  lastError = status; cooldown(status, http.header("Retry-After"));
+  String payload;
+  bool bodyOk = status > 0 && readBody(http, payload);
+  http.end(); client.stop();
+  if (status != 200) return false; // A failed login never invalidates the existing credentials.
+  if (!bodyOk) { lastError = 502; return false; }
+  JsonDocument doc;
+  if (deserializeJson(doc, payload) || doc["token_type"] != "Bearer") { lastError = 502; return false; }
+  // If Spotify reports granted scopes, reject an account without playback permissions.
+  if (doc["scope"].is<const char*>()) {
+    String scopes = " " + doc["scope"].as<String>() + " ";
+    if (scopes.indexOf(" user-read-playback-state ") < 0 || scopes.indexOf(" user-modify-playback-state ") < 0) {
+      lastError = 403; return false;
     }
-    HttpResult result = CallAPI("POST", "https://api.spotify.com/v1/me/player/next?device_id=" + deviceId, "{}");
-    return result.httpCode;
+  }
+  bool accepted = acceptTokens(payload, "", true, true);
+  if (accepted || lastError == 507) ResetState();
+  return accepted;
 }
-
-String SpotifyClient::GetDevices() {
-    if (!EnsureTokenFresh()) {
-        LOG("[SpotifyClient] Cannot fetch devices without a valid token.");
-        return "";
-    }
-
-    const int maxRetries = 3;
-    const int retryDelay = 2000;
-    String foundDeviceId = "";
-
-    for (int attempt = 1; attempt <= maxRetries; attempt++) {
-        char buffer[100];
-        sprintf(buffer, "[SpotifyClient] Fetching devices (Attempt %d)...", attempt);
-        LOG(buffer);
-
-        HttpResult result = CallAPI("GET", "https://api.spotify.com/v1/me/player/devices", "");
-        if (result.httpCode == 200) {
-            LOG("[SpotifyClient] Devices response: " + result.payload);
-            foundDeviceId = GetDeviceId(result.payload);
-            if (!foundDeviceId.isEmpty()) {
-                deviceId = foundDeviceId;
-                LOG("[SpotifyClient] Found device ID: " + foundDeviceId);
-                return foundDeviceId;
-            } else {
-                LOG("[SpotifyClient] Device not found. Retrying...");
-            }
-        } else {
-            LOG("[SpotifyClient] Failed to fetch devices. HTTP Code: " + String(result.httpCode));
-            LOG("Response: " + result.payload);
-        }
-
-        delay(retryDelay);
-    }
-
-    LOG("[SpotifyClient] Max retries reached. Device not found.");
-    return foundDeviceId;
+bool SpotifyClient::ReplaceRefreshToken(const String& candidate) { return exchange(candidate, true); }
+bool SpotifyClient::EnsureTokenFresh(bool force) {
+  if (persistencePending) {
+    if (!saveToken || !saveToken(refreshToken, pkce)) { lastError = 507; return false; }
+    persistencePending = false;
+  }
+  if (!force && IsTokenValid()) return true;
+  if (revoked && !force) { lastError = 401; return false; }
+  return exchange(refreshToken, false);
 }
-
-HttpResult SpotifyClient::CallAPI(String method, String url, String body) {
-    HttpResult result;
-    result.httpCode = 0;
-    result.payload = "";
-
-    // Ensure we have a fresh token before making the call
-    if (!EnsureTokenFresh()) {
-        LOG("[SpotifyClient] Cannot call API without a valid token.");
-        return result;
-    }
-
-    for (int attempts = 0; attempts < 2; attempts++) {
-        client.stop();
-        client.setInsecure();
-        HTTPClient http;
-        http.begin(client, url);
-        String authorization = "Bearer " + accessToken;
-        http.addHeader("Content-Type", "application/json");
-        http.addHeader("Authorization", authorization);
-
-        if (body.isEmpty() && (method == "PUT" || method == "POST")) {
-            body = "{}";
-            http.addHeader("Content-Length", String(body.length()));
-        }
-
-        if (method == "PUT") {
-            result.httpCode = http.PUT(body);
-        } else if (method == "POST") {
-            result.httpCode = http.POST(body);
-        } else if (method == "GET") {
-            result.httpCode = http.GET();
-        } else {
-            LOG("[SpotifyClient] Unsupported HTTP method.");
-            http.end();
-            break;
-        }
-
-        if (result.httpCode == 401 && attempts == 0) {
-            LOG("[SpotifyClient] Access token expired mid-call. Refreshing...");
-            tokenValid = false;
-            http.end();
-            if (!EnsureTokenFresh()) {
-                LOG("[SpotifyClient] Unable to refresh token after 401. Aborting call.");
-                return result;
-            }
-            continue; // Retry with new token
-        }
-
-        if (result.httpCode > 0) {
-            if (http.getSize() > 0) {
-                result.payload = http.getString();
-            }
-            http.end();
-            break; // exit the loop
-        } else {
-            LOG("[SpotifyClient] Failed to connect to URL: " + url);
-            http.end();
-        }
-    }
-
-    return result;
-}
-
-void SpotifyClient::ResetState() {
-    LOG("[SpotifyClient] Resetting Spotify client state...");
-    EnsureTokenFresh();
-    GetDevices();
-}
-
-String SpotifyClient::GetDeviceId(String json) {
-    DynamicJsonDocument doc(4096);
-    DeserializationError error = deserializeJson(doc, json);
-
-    if (error) {
-        LOG("[SpotifyClient] JSON parsing failed: " + String(error.c_str()));
-        return "";
-    }
-
-    JsonArray devices = doc["devices"].as<JsonArray>();
-    for (JsonObject device : devices) {
-        String name = device["name"].as<String>();
-        String id = device["id"].as<String>();
-
-        LOG("[SpotifyClient] Device name: " + name + ", ID: " + id);
-
-        if (name == deviceName) {
-            return id;
-        }
-    }
-
-    LOG("[SpotifyClient] " + deviceName + " device name not found.");
-    return "";
-}
-
-String SpotifyClient::ParseJson(String key, String json) {
-    DynamicJsonDocument doc(1024);
-    DeserializationError error = deserializeJson(doc, json);
-
-    if (error) {
-        LOG("[SpotifyClient] JSON parsing failed: " + String(error.c_str()));
-        return "";
-    }
-
-    if (doc[key].is<int>()) {
-        return String(doc[key].as<int>());
-    }
-    return doc[key] | "";
-}
-
-int SpotifyClient::DownloadFile(String url, uint8_t* buffer, size_t maxSize) {
-    client.stop();
-    client.setInsecure();
-
+HttpResult SpotifyClient::CallAPI(const String& method, const String& url, const String& body) {
+  HttpResult result;
+  if (!url.startsWith("https://api.spotify.com/v1/")) { result.httpCode = 400; return result; }
+  if (!EnsureTokenFresh()) { result.httpCode = lastError; return result; }
+  for (int attempt = 0; attempt < 2; ++attempt) {
     HTTPClient http;
-    http.begin(client, url);
-    // Some servers require a user-agent header
-    http.addHeader("User-Agent", "ESP32-Arduino-Spotify-Client/1.0");
-
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-        Serial.println("[SpotifyClient] DownloadFile GET failed, error: " + String(code));
-        http.end();
-        return 0; // Return 0 bytes on failure
+    if (!prepare(http, url)) { result.httpCode = lastError; return result; }
+    http.addHeader("Authorization", "Bearer " + accessToken);
+    http.addHeader("Content-Type", "application/json");
+    // Arduino HTTPClient only supplies this header for nonempty bodies. Spotify
+    // can reject empty playback PUT/POST requests with 411 when it is absent.
+    if ((method == "PUT" || method == "POST") && body.isEmpty()) http.addHeader("Content-Length", "0");
+    if (method == "GET") result.httpCode = http.GET();
+    else if (method == "PUT") result.httpCode = http.PUT(body);
+    else if (method == "POST") result.httpCode = http.POST(body);
+    else result.httpCode = 400;
+    cooldown(result.httpCode, http.header("Retry-After"));
+    bool bodyOk = result.httpCode <= 0 || result.httpCode == 204 || readBody(http, result.payload);
+    http.end(); client.stop();
+    if (result.httpCode == 401) {
+      tokenValid = false;
+      if (attempt == 0 && EnsureTokenFresh()) continue;
     }
-
-    WiFiClient& stream = http.getStream();
-    size_t count = 0;
-    unsigned long start = millis();
-
-    // 5 second timeout
-    while ((millis() - start) < 5000 && (http.connected() || stream.available())) {
-        while (stream.available() && count < maxSize) {
-            buffer[count++] = stream.read();
-        }
-        delay(1);
+    if (result.httpCode == 404 && url.indexOf("/me/player") >= 0) ResetState();
+    if (!bodyOk && success(result.httpCode)) result.httpCode = 502;
+    lastError = result.httpCode;
+    return result;
+  }
+  return result;
+}
+String SpotifyClient::GetDevices() {
+  ResetState();
+  HttpResult result = CallAPI("GET", "https://api.spotify.com/v1/me/player/devices");
+  JsonDocument doc;
+  if (result.httpCode != 200 || deserializeJson(doc, result.payload)) return "";
+  for (JsonObject device : doc["devices"].as<JsonArray>()) {
+    if (device["name"] == deviceName && !device["is_restricted"].as<bool>() && device["id"].is<const char*>()) {
+      deviceId = device["id"].as<String>(); break;
     }
-
-    http.end();
-    return count; // Return the number of bytes read
+  }
+  return deviceId;
+}
+bool SpotifyClient::resolveDevice() { return !deviceId.isEmpty() || !GetDevices().isEmpty(); }
+int SpotifyClient::Play(const String& uri) {
+  char normalized[SafeNdef::MaxUri];
+  if (!SafeNdef::normalize(uri.c_str(), normalized, sizeof(normalized))) return 400;
+  if (!resolveDevice()) return lastError == 200 ? 404 : lastError;
+  JsonDocument doc;
+  if (uri.startsWith("spotify:track:")) doc["uris"].to<JsonArray>().add(uri);
+  else { doc["context_uri"] = uri; if (!uri.startsWith("spotify:artist:")) doc["offset"]["position"] = 0; }
+  doc["position_ms"] = 0;
+  String body; serializeJson(doc, body);
+  return CallAPI("PUT", "https://api.spotify.com/v1/me/player/play?device_id=" + deviceId, body).httpCode;
+}
+int SpotifyClient::Next() {
+  if (!resolveDevice()) return lastError == 200 ? 404 : lastError;
+  return CallAPI("POST", "https://api.spotify.com/v1/me/player/next?device_id=" + deviceId).httpCode;
+}
+int SpotifyClient::DownloadFile(const String& url, uint8_t* buffer, size_t capacity) {
+  // Only accept the CDN hostname supplied by Spotify; credentials are never attached here.
+  if (!url.startsWith("https://i.scdn.co/")) return 0;
+  HTTPClient http;
+  if (!prepare(http, url)) return 0;
+  int code = http.GET();
+  if (code != 200 || http.getSize() > int(capacity)) { http.end(); client.stop(); return 0; }
+  BoundedSink sink(buffer, capacity);
+  int read = http.writeToStream(&sink);
+  bool ok = read >= 0 && !sink.failed && sink.count > 0 && (http.getSize() < 0 || sink.count == size_t(http.getSize()));
+  http.end(); client.stop();
+  return ok ? sink.count : 0;
 }

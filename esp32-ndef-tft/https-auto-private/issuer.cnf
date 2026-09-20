@@ -1,0 +1,11 @@
+[req]
+prompt=no
+distinguished_name=dn
+[dn]
+CN=spotify-player Device Issuer
+[extensions]
+basicConstraints=critical,CA:TRUE,pathlen:0
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
+nameConstraints=permitted;DNS:spotify-player.local,excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:0:0:0:0:0:0:0:0/0:0:0:0:0:0:0:0

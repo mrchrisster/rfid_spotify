@@ -1,0 +1,10 @@
+[req]
+prompt=no
+distinguished_name=dn
+x509_extensions=extensions
+[dn]
+CN=RFID Player Private Root
+[extensions]
+basicConstraints=critical,CA:TRUE,pathlen:0
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
