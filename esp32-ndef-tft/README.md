@@ -68,11 +68,18 @@ Open `esp32SpotifyAlexa_v5_tft_ndef.ino` in Arduino IDE, or run the following co
 cp secrets.example.h secrets.h
 ```
 
-Edit `secrets.h` with your Wi-Fi credentials, Spotify app credentials, and target speaker name. The speaker name should match the name shown by Spotify.
+Edit `secrets.h` with your initial Wi-Fi credentials, Spotify app credentials,
+and target speaker name. The speaker name should match the name shown by Spotify.
+Wi-Fi entered later through setup takes precedence over these initial credentials;
+changing networks does not require reflashing.
 
 Leave `refreshToken` empty to authorize through the web dashboard. It is an optional bootstrap credential: once a token is saved on the device, the saved token takes precedence over this field.
 
-For a screenless player, change the default `PLAYER_HAS_DISPLAY` value to `0` in [DeviceConfig.h](DeviceConfig.h). Leave it at `1` for the TFT version.
+For a screenless player, set `PLAYER_HAS_DISPLAY` to `0` in
+[DeviceConfig.h](DeviceConfig.h). The default is `1` for the TFT version.
+For a reader-isolation test, `0` disables display traffic while keeping RFID,
+Spotify, and the web dashboard enabled; it does not electrically disconnect
+the display module.
 
 ### 2. Provision HTTPS
 
@@ -143,10 +150,199 @@ arduino-cli upload --profile esp32-review --port /path/to/serial-port .
 3. Sign in to Spotify and approve access.
 4. Wait for **Spotify reconnected and saved**.
 5. Return to the dashboard and click **Test saved refresh token**.
-6. Use **Find speakers**, choose the target, and click **Select speaker** if needed.
+6. Use **Find speakers**, choose the target, and click **Save default speaker**.
 7. Scan a programmed card.
 
 To verify persistence, reboot the player and run **Test saved refresh token** again. A pass confirms that the restored refresh token can obtain a new access token.
+
+## Display
+
+The optional TFT opens with the supplied headphone logo and a “Pick a story!”
+prompt for audiobook listening. A compact strip shows Wi-Fi, Spotify authorization, reader status,
+and the local web address. Connection or reader problems replace the prompt
+with a short message; a missing/rejected credential asks a grown-up to connect
+Spotify through the web dashboard.
+
+The logo is a static RGB565 bitmap stored in flash (about 39 KB).
+Its edited source is in `assets/player-head-source.png`; regenerate the firmware
+header with `python3 tools/encode_player_logo.py` (requires Pillow).
+
+![Startup screen preview](assets/startup-preview.png)
+
+The illustration is static. While this screen is visible, the firmware checks
+for status changes once a second and redraws only the message/status area when
+needed. Album artwork takes over during playback; the dashboard's **Show startup screen**
+button brings the companion back. The startup screen stays visible for 30 minutes, including when opened with the
+button. Cover duration is configurable below. These indicators report connectivity and authorization, not a
+guarantee that the selected speaker is available.
+
+### Web dashboard
+
+The dashboard has three main pages, with a single column on phones and two
+columns for player controls and diagnostics on larger screens. The logo is
+embedded locally; no external fonts, scripts or image services are needed.
+
+- **Player:** connection badges, default speaker, playback/volume controls, and
+  startup/cover screen buttons. Connection problems appear above the controls.
+- **Settings:** expandable Speaker, Display, Spotify connection, and Wi-Fi
+  sections. Manual refresh-token replacement is under Spotify → Advanced.
+- **Diagnostics:** health summary, technical details, token test, live logs with
+  pause/copy controls, TFT debug mode, and reader/player recovery controls.
+
+Logs are fetched only while Diagnostics is open and not paused. Copy logs works
+on local HTTP using a clipboard fallback; if the browser rejects copying, select
+the text manually. Screenless players hide TFT controls. The existing
+`#speakerSetup` link from Wi-Fi provisioning still opens speaker settings.
+
+### Live logs and cover duration
+
+Choose cover time in **Settings → Display**, or enable **Show live logs on TFT**
+in **Diagnostics**, then click **Save display settings**. Both settings survive restarts.
+
+- Live-log mode replaces artwork with the latest 18 wrapped lines from the same
+  application log shown in the dashboard. It refreshes only when new messages
+  arrive, at most once per second. It does not capture ROM/panic output or enable
+  the separate verbose RFID build option. Turning it off restores the latest
+  cached cover, or the info screen if no cover is cached.
+- Cover time is entered in **minutes** (decimals allowed, up to **1440**); **0** keeps covers visible until replaced or
+  manually cleared. The default is **10 minutes**. Existing saved durations are preserved. Changing the duration applies
+  to the currently displayed cover's elapsed time. When it expires, the startup
+  screen appears for 30 minutes, then the display goes blank. Audio continues.
+  A cover time of 0 keeps the cover visible until another display action.
+- Wi-Fi setup instructions take priority over live logs, artwork, and blanking.
+  Manual display buttons are disabled while setup or live-log mode is active.
+
+### Startup readiness
+
+Cards presented before Wi-Fi, clock synchronization or Spotify authentication
+are ready remain queued; a newer card replaces the waiting request. Startup
+refresh checks readiness every second, honoring network cooldowns. Normal
+auth maintenance remains every 30 seconds. Revoked or invalid credentials still
+require reconnecting Spotify.
+
+### Card feedback and loading animation
+
+A newly selected card immediately shows an animated storybook, before NDEF
+reading or any Spotify request. Page turning and story sparks update every
+120 ms in a small screen region; the reader/display worker owns all SPI drawing.
+The full-quality cover replaces the animation as soon as it is downloaded and
+validated. Wi-Fi setup and TFT debug mode keep their existing priority.
+
+Unsupported cards and read failures have distinct localized error screens.
+Playback failures, unavailable covers and a full command queue also give feedback.
+Errors remain for five seconds, then return to the startup screen; another card
+can replace them immediately. Loading returns to the startup screen after 90
+seconds if no cover arrives, without cancelling a pending playback request.
+A held card does not restart the animation. Older results cannot replace a newer
+card's loading screen or error.
+
+### Cover loading and retry
+
+Album cards (including albums chosen for artist cards) and track cards request
+artwork from their own metadata. If a large album response exceeds the bounded
+JSON limit, the player falls back to playback metadata and checks that it matches
+the requested album/track. Other contexts use currently-playing metadata.
+Failed artwork requests retry up to three attempts while the command queue is idle.
+Playback does not restart during these retries.
+
+**Last cover** redraws the cached image; if no image is cached, it requests one.
+**Reload cover** fetches artwork again without changing playback. Look for `[Art]`
+log lines reporting metadata/download/memory problems or confirming the cover
+was drawn. Cover downloads establish HTTPS before allocating JPEG storage. Known-size
+images allocate only their reported size, bounded by available contiguous memory
+and 64 KB, with 16 KB remaining working space while TLS is live. When the preferred JPEG fits the 64 KB limit but not the live HTTPS memory
+budget, it downloads through a temporary SPIFFS file, closes HTTPS, then sends the file to the display worker for direct JPEG decoding. It never
+allocates the complete file in RAM. This uses the documented 128 KB SPIFFS partition. Only an
+entirely erased partition is automatically formatted; existing data is preserved
+on mount failure. Temporary files are removed after decoding (or queue/download failure). This fallback writes
+flash; downloads that fit RAM do not. Images narrower than 240 pixels are never selected; if no suitable cover can
+be displayed, the failure is logged instead of showing a pixelated thumbnail. Logs report buffer capacity and known JPEG size; local
+code 413 means the cover exceeded the buffer. Covers scale to fill 320×240 with centered cropping and preserved aspect ratio.
+For the RAM download path, JPEGs larger than 24 KB are
+released after display so subsequent Spotify HTTPS requests have enough RAM;
+Last cover fetches again for those images and requires a network connection.
+Successful playback alone does not mean the artwork loaded.
+
+Refreshing the dashboard only reads status, cached speakers and logs. Click
+**Find speakers** to request fresh Spotify speaker discovery.
+
+### Screen language
+
+In the web dashboard, open **Settings → Display → Screen language**, choose **English**,
+**Deutsch**, **Français**, or **Español**, then click **Save language**. The choice
+is saved on the device and survives restarts. If saving fails, the previous
+setting stays active. Devices without a saved choice default to German.
+
+Prompts, connection messages, and reader labels on the TFT use the selected
+language, including accented characters. The logo stays unchanged. The info
+screen updates without a reboot; if artwork is showing, use **Device info** to
+view it. The maintenance dashboard and diagnostic logs remain in English.
+
+## Changing Wi-Fi without a computer
+
+After 30 seconds without a Wi-Fi connection, the player creates a
+password-protected setup network. You can also open the normal dashboard and
+click **Change Wi-Fi** to start setup while the old network is still available.
+
+1. Read the **WLAN einrichten / Wi-Fi setup** instructions on the TFT.
+2. On your phone, join the displayed `StoryPlayer-Setup-XXXXXX` network using
+   the displayed setup password. Stay connected if the phone warns that the
+   network has no internet.
+3. Open the setup page automatically offered by your phone, or enter
+   **http://192.168.4.1** in its browser. Use HTTP, not HTTPS.
+4. Find nearby networks or enter the SSID manually, enter the Wi-Fi password,
+   and choose **Connect and save**. An empty password selects an open network.
+5. Wait for confirmation, then reconnect your phone to your home Wi-Fi.
+   The setup network closes 30 seconds after a successful save.
+6. Follow **Choose the default Echo** on the confirmation page to open the
+   player's dashboard on the new network. Click **Find speakers**, choose your
+   Echo, then **Save default speaker**. Wait for the saved confirmation before
+   scanning a card. The TFT also shows this next step and the new web address.
+
+![Example German Wi-Fi setup screen](assets/wifi-setup-preview.png)
+
+The pictured password and network suffix are examples. Each player generates and
+stores its own setup password. The dashboard's **Wi-Fi setup** section and USB
+Serial output at 115200 baud also show it. For a screenless player, keep those
+details on a label before moving it to another network; USB Serial remains an
+offline fallback if the label is unavailable.
+
+The player tests a new connection for up to 30 seconds. It saves only after
+joining the requested network, obtaining an IP address, and staying connected
+for three seconds. This verifies Wi-Fi access, not internet or Spotify service.
+Failed connection tests and failed credential writes retain the previous saved
+credentials and return to that network. **Cancel / previous Wi-Fi** abandons a
+pending attempt. The setup network remains available after failure so you can
+correct the password. An automatically opened portal closes after the saved network returns and
+stays connected for ten continuous seconds. A connection drop restarts that
+timer. A portal opened with **Change Wi-Fi**, or used to scan/test new credentials,
+stays open until setup succeeds or you cancel it.
+
+Spotify tokens, speaker selection, HTTPS identity, and language settings are
+preserved. The setup network does not provide internet access. When the player
+joins a router on a different Wi-Fi channel, the phone may briefly disconnect;
+rejoin the setup network and reopen the page to check the result. The TFT setup
+instructions and phone page support English, German, French, and Spanish. Setup
+instructions take priority over cover art and the normal screen timeout.
+
+The portal is intended for ordinary home Wi-Fi (2.4 GHz on the original ESP32),
+not enterprise authentication or networks requiring a separate hotel-style login.
+
+## Default Echo / speaker
+
+The dashboard's **Default Echo / speaker** section shows the current default and
+lets you discover and save another Spotify Connect speaker. The saved name is
+restored at boot and the current device ID is rediscovered as needed. Choose
+unique names for your Echo devices so rediscovery identifies the intended one.
+The speaker must be available in Spotify and the player must be authorized.
+
+Choosing a default requests a playback transfer with `play: false`, so setup does
+not automatically start audio (it can pause existing playback). The firmware
+validates the selected ID/name against Spotify's current device list before
+transfer and saving. A failed save retains the previous firmware default; a
+transfer may already have taken place. The dashboard confirms success only when
+the queued job completes. Reconnect Spotify if the device is not authorized,
+then return to this section.
 
 ## Preparing and using cards
 
@@ -243,6 +439,13 @@ The first command writes a token to a new private file without printing it. The 
 | Black display | Confirm the boot banner reports `TFT=1`, then check display connections and power. |
 | Error `507` after a credential update | The credential is usable in RAM but flash persistence failed. Avoid rebooting until the save warning clears. |
 | Unexpected reboot | Capture the full Serial Monitor output before and after the boot banner, including reset reason and any panic, brownout, or watchdog messages. |
+
+Reader logs are concise by default: one line per completed recovery, and an
+unavailable-reader warning at most once every 30 seconds during a continuous
+failure. Scan, removal, and failed card-read messages remain visible. Set
+`PLAYER_RFID_DEBUG` to `1` in `DeviceConfig.h` to restore register dumps,
+recovery-trigger details, and individual selection errors. Recovery behavior
+and diagnostic counters are unchanged.
 
 Dashboard commands are asynchronous: **202 plus a job ID means queued**, not completed. The dashboard polls for the result; successful Spotify operations commonly return 200 or 204. Only the latest eight job outcomes are retained.
 

@@ -17,10 +17,22 @@ env = dict(os.environ, UBSAN_OPTIONS="halt_on_error=1", ASAN_OPTIONS="abort_on_e
 with tempfile.TemporaryDirectory(prefix="spotify-tests-") as temporary:
     for name, sources, extra in [
         ("core", ["tests/test_core.cpp"], []),
+        ("loading", ["tests/test_loading.cpp"], []),
+        ("language", ["tests/test_language.cpp"], []),
+        ("display_settings", ["tests/test_display_settings.cpp"], []),
+        ("wifi_setup", ["tests/test_wifi_setup.cpp"], ["-Itests/fakes/wifi_setup", "-Itests/fakes/identity",
+            "-DARDUINOJSON_ENABLE_ARDUINO_STRING=1", "-DARDUINOJSON_ENABLE_ARDUINO_STREAM=0",
+            "-DARDUINOJSON_ENABLE_ARDUINO_PRINT=0", "-DARDUINOJSON_ENABLE_PROGMEM=0", "-I" + str(args.arduino_json)]),
+        ("safe_tls", ["tests/test_safe_tls.cpp"], ["-DARDUINO_ARCH_ESP32", "-Itests/fakes/dns"]),
         ("oauth", ["tests/test_oauth.cpp"], []),
         ("certificate", ["tests/test_certificate_policy.cpp"], []),
         ("rfid", ["tests/test_rfid.cpp"], []),
         ("rfid_presence", ["tests/test_rfid_presence.cpp"], []),
+        ("artwork_spool", ["tests/test_artwork_spool.cpp"], ["-Itests/fakes/spool"]),
+        ("artwork", ["tests/test_artwork.cpp"], [
+            "-DARDUINOJSON_ENABLE_ARDUINO_STRING=1", "-DARDUINOJSON_ENABLE_ARDUINO_STREAM=0",
+            "-DARDUINOJSON_ENABLE_ARDUINO_PRINT=0", "-DARDUINOJSON_ENABLE_PROGMEM=0", "-I" + str(args.arduino_json),
+        ]),
         ("spotify", ["tests/test_spotify.cpp", "SpotifyClient.cpp"], [
             "-DARDUINOJSON_ENABLE_ARDUINO_STRING=1", "-DARDUINOJSON_ENABLE_ARDUINO_STREAM=0",
             "-DARDUINOJSON_ENABLE_ARDUINO_PRINT=0", "-DARDUINOJSON_ENABLE_PROGMEM=0", "-I" + str(args.arduino_json),
@@ -36,8 +48,10 @@ with tempfile.TemporaryDirectory(prefix="spotify-tests-") as temporary:
     ]:
         output = str(Path(temporary) / name)
         subprocess.run(["clang++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined", "-g",
-                        "-Itests/fakes", "-I.", *extra, *sources, "-o", output], cwd=root, check=True, env=env)
+                        *extra, "-Itests/fakes", "-I.", *sources, "-o", output], cwd=root, check=True, env=env)
         subprocess.run([output], cwd=root, check=True, env=env)
 subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"], cwd=root, check=True)
 
 subprocess.run(['node', 'tests/test_dashboard.js'], cwd=root, check=True)
+
+subprocess.run(['node', 'tests/test_wifi_portal.js'], cwd=root, check=True)

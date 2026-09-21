@@ -18,6 +18,11 @@ int main(){
   RfidReader reader(classic);assert(reader.begin());uint8_t actual[720];assert(reader.read(0,actual,sizeof(actual)));
   for(size_t i=0;i<720;++i)assert(actual[i]==i%251);
   assert(classic.auths==45);classic.fail=true;RfidReader broken(classic);assert(broken.begin());assert(!broken.read(0,actual,16)&&broken.ioError);
+  assert(broken.lastStatus==MFRC522::STATUS_ERROR && broken.errorAddress==4);
+  assert(strcmp(broken.errorOperation,"authenticate")==0);
+  MFRC522 absent;absent.fail=true;RfidReader missing(absent);assert(!missing.begin());
+  assert(missing.ioError && missing.lastStatus==MFRC522::STATUS_ERROR && missing.errorAddress==3);
+  assert(strcmp(missing.errorOperation,"capability read")==0);
   MFRC522 small;small.memory.resize(32);small.memory[12]=0xe1;small.memory[13]=0x10;small.memory[14]=255;
   RfidReader invalid(small);assert(!invalid.begin());
   puts("RFID Type-2 capacity/boundary tests and Classic sector mapping passed");

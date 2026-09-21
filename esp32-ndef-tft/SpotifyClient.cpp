@@ -6,6 +6,10 @@
 #include <base64.h>
 #include <time.h>
 #include <new>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <esp_heap_caps.h>
+#include "ArtworkSpool.h"
+#endif
 
 // Mozilla trust bundle embedded by the pinned ESP32 core; never disable verification.
 extern const uint8_t bundleStart[] asm("_binary_x509_crt_bundle_start");
@@ -18,7 +22,7 @@ class BoundedSink : public Stream {
   uint32_t started = millis();
 public:
   size_t count = 0;
-  bool failed = false;
+  bool failed = false, overflow = false;
   BoundedSink(uint8_t* buffer, size_t capacity) : buffer(buffer), capacity(capacity) {}
   int available() override { return 0; }
   int read() override { return -1; }
@@ -26,7 +30,8 @@ public:
   void flush() override {}
   size_t write(uint8_t b) override { return write(&b, 1); }
   size_t write(const uint8_t* data, size_t size) override {
-    if (failed || size > capacity - count || millis() - started > 10000) { failed = true; return 0; }
+    if(size > capacity-count)overflow=true;
+    if (failed || overflow || millis() - started > 10000) { failed = true; return 0; }
     memcpy(buffer + count, data, size); count += size; return size;
   }
 };
@@ -226,15 +231,70 @@ int SpotifyClient::Next() {
   return CallAPI("POST", "https://api.spotify.com/v1/me/player/next?device_id=" + deviceId).httpCode;
 }
 int SpotifyClient::DownloadFile(const String& url, uint8_t* buffer, size_t capacity) {
+  return download(url,buffer,capacity,false);
+}
+int SpotifyClient::DownloadArtwork(const String& url, uint8_t*& buffer, size_t maxCapacity) {
+  // Caller owns the successful result. Never overwrite a live allocation.
+  if(buffer) {lastError=400;return 0;}
+#if defined(ARDUINO_ARCH_ESP32)
+  if(ArtworkSpool::busy.load()){lastError=429;return 0;}
+  // Mount/format before GET so first-use initialization cannot stall the body.
+  ArtworkSpool::mount();
+#endif
+  int count=download(url,buffer,maxCapacity,true);
+#if defined(ARDUINO_ARCH_ESP32)
+  if(!ArtworkSpool::busy.load() && ArtworkSpool::mounted)ArtworkSpool::release();
+#endif
+  return count;
+}
+int SpotifyClient::download(const String& url, uint8_t*& buffer, size_t capacity, bool allocate) {
   // Only accept the CDN hostname supplied by Spotify; credentials are never attached here.
-  if (!url.startsWith("https://i.scdn.co/")) return 0;
+  if (!url.startsWith("https://i.scdn.co/")) {lastError=400;return 0;}
   HTTPClient http;
-  if (!prepare(http, url)) return 0;
+  if (!prepare(http, url)) {logMessage("[Art] Connection preparation failed (code="+String(lastError)+")");return 0;}
+  // Establish DNS/TCP/TLS and receive headers BEFORE reserving JPEG memory.
   int code = http.GET();
-  if (code != 200 || http.getSize() > int(capacity)) { http.end(); client.stop(); return 0; }
+#if defined(ARDUINO_ARCH_ESP32)
+  if(code<0) {
+    char reason[160]={};int tlsError=client.lastError(reason,sizeof(reason));
+    logMessage("[Art] HTTPS failed: "+HTTPClient::errorToString(code)+"; DNS="+String(client.lastDnsError())+"; TLS="+String(tlsError)+" "+String(reason));
+    logMessage("[Art] At failure: free="+String(heap_caps_get_free_size(MALLOC_CAP_8BIT))+"; largest="+String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+  }
+#endif
+  lastError=code;
+  if (code != 200 || http.getSize() > int(capacity)) {
+    if(code==200) {
+      lastError=413;
+      logMessage("[Art] JPEG size="+String(http.getSize())+" exceeds buffer="+String(capacity));
+    }
+    cooldown(code,http.header("Retry-After"));http.end();client.stop();return 0;
+  }
+  if(allocate) {
+    // TLS is now live: preserve working space without budgeting its handshake twice.
+    size_t available=capacity;
+#if defined(ARDUINO_ARCH_ESP32)
+    size_t freeBytes=heap_caps_get_free_size(MALLOC_CAP_8BIT),largest=heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    available=freeBytes>16*1024?freeBytes-16*1024:0;
+    if(available>largest)available=largest;
+    available=available>256?available-256:0;
+    if(available>capacity)available=capacity;
+#endif
+    size_t required=http.getSize()>=0?size_t(http.getSize()):available;
+    logMessage("[Art] HTTPS connected; JPEG size="+String(http.getSize())+"; buffer budget="+String(available));
+#if defined(ARDUINO_ARCH_ESP32)
+    if(required>available) {
+      logMessage("[Art] Keeping full-quality cover via temporary flash download");
+      return ArtworkSpool::download(http,client,buffer,capacity,lastError);
+    }
+#endif
+    if(!required || required>available) {lastError=413;http.end();client.stop();return 0;}
+    capacity=required;buffer=static_cast<uint8_t*>(malloc(capacity));
+    if(!buffer) {lastError=507;http.end();client.stop();return 0;}
+  }
   BoundedSink sink(buffer, capacity);
   int read = http.writeToStream(&sink);
   bool ok = read >= 0 && !sink.failed && sink.count > 0 && (http.getSize() < 0 || sink.count == size_t(http.getSize()));
   http.end(); client.stop();
+  if(!ok) {lastError=sink.overflow?413:502;if(allocate){free(buffer);buffer=nullptr;}}
   return ok ? sink.count : 0;
 }

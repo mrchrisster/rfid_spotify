@@ -1,6 +1,17 @@
 #pragma once
 #include <stdint.h>
 namespace RfidRecovery {
+// Shared by every reset trigger; unsigned subtraction handles millis() rollover.
+class Cooldown {
+  bool started = false;
+  uint32_t last = 0;
+public:
+  static constexpr uint32_t IntervalMs = 5000;
+  bool acquire(uint32_t now) {
+    if (started && uint32_t(now - last) < IntervalMs) return false;
+    started = true; last = now; return true;
+  }
+};
 struct Registers {
   uint8_t version, antenna, timer, prescaler, command;
   bool healthy() const {

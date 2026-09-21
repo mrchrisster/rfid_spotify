@@ -16,3 +16,11 @@
 #if PLAYER_REQUIRE_WEB_AUTH != 0 && PLAYER_REQUIRE_WEB_AUTH != 1
 #error "PLAYER_REQUIRE_WEB_AUTH must be 0 or 1"
 #endif
+
+// Enable verbose reader register dumps and per-operation errors when diagnosing SPI.
+#ifndef PLAYER_RFID_DEBUG
+#define PLAYER_RFID_DEBUG 0
+#endif
+#if PLAYER_RFID_DEBUG != 0 && PLAYER_RFID_DEBUG != 1
+#error "PLAYER_RFID_DEBUG must be 0 or 1"
+#endif

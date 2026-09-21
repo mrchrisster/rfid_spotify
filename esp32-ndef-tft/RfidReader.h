@@ -9,6 +9,13 @@ class RfidReader {
   uint8_t cache[18] = {};
 public:
   bool ioError = false;
+  MFRC522::StatusCode lastStatus = MFRC522::STATUS_OK;
+  const char* errorOperation = "none";
+  uint8_t errorAddress = 0, responseBytes = 0;
+  bool failed(const char* operation, uint8_t address, MFRC522::StatusCode status, uint8_t bytes = 0) {
+    ioError = true; errorOperation = operation; errorAddress = address;
+    lastStatus = status; responseBytes = bytes; return false;
+  }
   explicit RfidReader(MFRC522& chip) : chip(chip) {}
   bool begin() {
     auto type = chip.PICC_GetType(chip.uid.sak);
@@ -16,7 +23,8 @@ public:
     if (classic) { capacity = 720; return true; }
     if (type != MFRC522::PICC_TYPE_MIFARE_UL) return false;
     uint8_t cc[18], count = sizeof(cc);
-    if (chip.MIFARE_Read(3, cc, &count) != MFRC522::STATUS_OK || count != 18) { ioError = true; return false; }
+    auto status = chip.MIFARE_Read(3, cc, &count);
+    if (status != MFRC522::STATUS_OK || count != 18) return failed("capability read", 3, status, count);
     if (cc[0] != 0xe1 || (cc[1] >> 4) != 1 || (cc[3] >> 4) != 0) return false;
     capacity = size_t(cc[2]) * 8;
     // Page addressing is one byte. CC is untrusted.
@@ -33,12 +41,12 @@ public:
         if (classic) {
           address = 4 + (base / 48) * 4 + (base % 48) / 16;
           MFRC522::MIFARE_Key key = {{0xd3,0xf7,0xd3,0xf7,0xd3,0xf7}};
-          if (chip.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, address, &key, &chip.uid) != MFRC522::STATUS_OK) {
-            ioError = true; return false;
-          }
+          auto status = chip.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, address, &key, &chip.uid);
+          if (status != MFRC522::STATUS_OK) return failed("authenticate", address, status);
         } else address = 4 + base / 4;
         uint8_t count = sizeof(cache);
-        if (chip.MIFARE_Read(address, cache, &count) != MFRC522::STATUS_OK || count != 18) { ioError = true; return false; }
+        auto status = chip.MIFARE_Read(address, cache, &count);
+        if (status != MFRC522::STATUS_OK || count != 18) return failed("data read", address, status, count);
         cached = base;
       }
       size_t available = 16 - (offset - base), copy = size < available ? size : available;

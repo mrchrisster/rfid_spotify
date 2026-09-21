@@ -1,6 +1,6 @@
 #pragma once
 #include <Arduino.h>
-#include <WiFiClientSecure.h>
+#include "SafeTlsClient.h"
 #include <HTTPClient.h>
 
 void logMessage(const String& message);
@@ -27,9 +27,12 @@ public:
   int Play(const String& uri);
   int Next();
   HttpResult CallAPI(const String& method, const String& url, const String& body = "");
+  // ESP32: positive count with null buffer transfers ownership of ArtworkSpool file.
+  int DownloadArtwork(const String& url, uint8_t*& buffer, size_t maxCapacity);
   int DownloadFile(const String& url, uint8_t* buffer, size_t capacity);
 private:
-  WiFiClientSecure client;
+  int download(const String& url, uint8_t*& buffer, size_t capacity, bool allocate);
+  SafeTlsClient client;
   String clientId, clientSecret, deviceName, deviceId, refreshToken, accessToken;
   bool pkce = false;
   bool tokenValid = false, revoked = false, persistencePending = false;

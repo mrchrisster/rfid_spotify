@@ -40,6 +40,16 @@ int main() {
   assert(!presence.missing(UINT32_MAX-500,true));
   assert(presence.missing(1000,true)); // millis rollover.
   assert(presence.seen(a,4));
+  RfidRecovery::Cooldown gate;
+  assert(gate.acquire(0));
+  assert(!gate.acquire(150)); // Failed reset immediately followed by another trigger.
+  assert(!gate.acquire(4999));
+  assert(gate.acquire(5000));
+  assert(!gate.acquire(5001));
+  RfidRecovery::Cooldown rollover;
+  assert(rollover.acquire(UINT32_MAX-1000));
+  assert(!rollover.acquire(3998));
+  assert(rollover.acquire(3999));
   Pins pins;Reader reader{pins};
   RfidRecovery::reset(reader,pins,5,4);
   assert((pins.events==std::vector<int>{1,2,4,3,4}));
