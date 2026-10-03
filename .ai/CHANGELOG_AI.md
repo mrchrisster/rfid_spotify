@@ -235,3 +235,6 @@ This entry summarizes earlier work; it is not a claim that all changes occurred 
 ## 2026-10-03 — Arduino dependency installation and OTA discoverability
 - README now lists six exact library names/authors/tested versions/purposes, board core3.3.11 setup/index, transitive Adafruit dependencies, bundled core libraries, headless differences and setup troubleshooting. Added setup navigation to existing OTA/variant instructions and explicit manual browser OTA/no unattended update distinction.
 - Verified against sketch.yaml, current source includes, installed library.properties and official Arduino/Espressif installation guides. Documentation only; no firmware rebuild, test run or device upload. Existing pending hardware/security follow-ups unchanged.
+
+## 2026-10-03 — Fix archived filename rejected by Arduino IDE
+- User reported settings copy.h cannot be used; located file under archive/legacy-versions/esp32-display, renamed settings_copy.h without content changes. Archive README explains rename. Recursive source filename check passes; git diff whitespace check passes. No firmware rebuild/upload; user IDE confirmation pending.

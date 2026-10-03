@@ -18,3 +18,5 @@ Old folder/sketch names may need adjustment to build with Arduino; these are sou
 Embedded provisioning values have been replaced with `CONFIGURE_LOCALLY` and private certificate/key files omitted. Earlier commits still contain previously published material; deleting files here does not revoke credentials or remove Git history. Rotate affected credentials/keys separately.
 
 `esp32/README.md` and `esp32/readme.md` differed only in case. Both are preserved, with the latter renamed `README-additional.md` for macOS/Windows compatibility.
+
+`esp32-display/settings copy.h` was renamed `settings_copy.h` because Arduino IDE rejects the space-containing sketch filename, even when encountered in this archive. Contents are preserved.

@@ -233,3 +233,5 @@ Updated: 2026-09-21. Paths below are repository-relative unless absolute.
 - Original local hardware workspace stays at existing path/sketch name. Publication checkout saved at `github/rfid_spotify/` inside it, ignored by original workspace; future GitHub changes use that checkout. Don't copy personal build/private files into it. No new firmware release or hardware test implied by repository publication.
 
 - A26 validation: root sketch compiles with only example provisioning/no private certificate; both variants + full host suite pass. Archive retains historical code and intentional Markdown line-break whitespace; source remains unmodified beyond credential placeholders. Published main uses Arduino-matching basename rfid_spotify.
+
+- A26 archive filename correction: preserve old settings copy as `archive/legacy-versions/esp32-display/settings_copy.h`; Arduino IDE reported rejecting space-containing original despite archive location. CLI compilation alone did not expose this IDE compatibility issue.
