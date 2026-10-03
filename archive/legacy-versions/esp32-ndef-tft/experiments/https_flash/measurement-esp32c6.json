@@ -1,0 +1,66 @@
+{
+  "fqbn": "esp32:esp32:esp32c6",
+  "temporary_directory": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp",
+  "builds": {
+    "baseline": {
+      "exit_code": 1,
+      "log": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp/baseline.log",
+      "build_directory": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp/build-baseline",
+      "display": true,
+      "fqbn": "esp32:esp32:esp32c6",
+      "flash_bytes": 1402502,
+      "partition_bytes": 1310720,
+      "remaining_bytes": -91782,
+      "static_ram_bytes": 52076,
+      "ram_total_bytes": 327680
+    },
+    "baseline-screenless": {
+      "exit_code": 1,
+      "log": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp/baseline-screenless.log",
+      "build_directory": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp/build-baseline-screenless",
+      "display": false,
+      "fqbn": "esp32:esp32:esp32c6",
+      "flash_bytes": 1336202,
+      "partition_bytes": 1310720,
+      "remaining_bytes": -25482,
+      "static_ram_bytes": 47956,
+      "ram_total_bytes": 327680
+    },
+    "https-pkce": {
+      "exit_code": 1,
+      "log": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp/https-pkce.log",
+      "build_directory": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp/build-https-pkce",
+      "display": true,
+      "fqbn": "esp32:esp32:esp32c6",
+      "flash_bytes": 1451706,
+      "partition_bytes": 1310720,
+      "remaining_bytes": -140986,
+      "static_ram_bytes": 52260,
+      "ram_total_bytes": 327680
+    },
+    "https-pkce-screenless": {
+      "exit_code": 1,
+      "log": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp/https-pkce-screenless.log",
+      "build_directory": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp/build-https-pkce-screenless",
+      "display": false,
+      "fqbn": "esp32:esp32:esp32c6",
+      "flash_bytes": 1385390,
+      "partition_bytes": 1310720,
+      "remaining_bytes": -74670,
+      "static_ram_bytes": 48132,
+      "ram_total_bytes": 327680
+    },
+    "https-pkce-larger-partition": {
+      "exit_code": 0,
+      "log": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp/https-pkce-larger-partition.log",
+      "build_directory": "/var/folders/t7/1tjw31gj4s53347gz83l1_800000gn/T/spotify-https-flash-xvsf_ekp/build-https-pkce-larger-partition",
+      "display": true,
+      "fqbn": "esp32:esp32:esp32c6:PartitionScheme=min_spiffs",
+      "flash_bytes": 1451746,
+      "partition_bytes": 1966080,
+      "remaining_bytes": 514334,
+      "static_ram_bytes": 52260,
+      "ram_total_bytes": 327680
+    }
+  }
+}
