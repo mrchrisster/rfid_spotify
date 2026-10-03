@@ -79,6 +79,82 @@ Use a common ground and the supply voltage required by each module. The reader a
 
 ## Setup
 
+Quick links: [Arduino libraries and board package](#0-install-arduino-board-support-and-libraries) · [Build and upload](#4-build-and-upload) · [Wireless firmware updates (OTA)](#wireless-firmware-updates) · [Display/headless variants](#display-and-headless-update-variants).
+
+### 0. Install Arduino board support and libraries
+
+Use Arduino IDE 2.x. The versions below match [sketch.yaml](sketch.yaml) and the
+validated display/headless builds; they are the tested baseline, not a claim
+that every newer release is compatible. Install them manually in the IDE;
+the CLI profile instructions below provide the pinned dependency workflow.
+
+#### ESP32 board package (Boards Manager)
+
+1. Open Arduino IDE **Preferences / Settings** and add the following entry to
+   **Additional Boards Manager URLs** (keep any existing entries):
+
+   ```text
+   https://espressif.github.io/arduino-esp32/package_esp32_index.json
+   ```
+
+2. Open **Tools → Board → Boards Manager**, search for **esp32**, and install
+   **esp32 by Espressif Systems**, version **3.3.11**.
+3. Select **ESP32 Dev Module** for the hardware-tested original ESP32. The
+   experimental C6 profile is not the board used by this player.
+4. Use the flash and partition settings in [Build and upload](#4-build-and-upload).
+   OTA requires the documented two-slot partition layout.
+
+See [Espressif's Arduino IDE installation guide](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)
+for board-package installation details.
+
+#### Libraries (Library Manager)
+
+Open **Tools → Manage Libraries** (or the Library Manager sidebar), search for
+each exact name below, choose the listed version, and click **Install**.
+When offered dependencies, choose **Install all**, then check that GFX and BusIO
+use the versions in this table. [Arduino's library installation guide](https://support.arduino.cc/hc/en-us/articles/5145457742236-Install-libraries-in-the-Arduino-IDE)
+explains the Library Manager controls.
+
+| Library Manager name | Author / maintainer | Tested version | Purpose | Required for |
+| --- | --- | --- | --- | --- |
+| **ArduinoJson** | Benoit Blanchon | **7.4.3** | Spotify responses, dashboard data and saved playback metadata | Display and headless |
+| **MFRC522** | GithubCommunity | **1.4.12** | SPI RFID reader driver; provides `MFRC522.h` | Display and headless |
+| **Adafruit ILI9341** | Adafruit | **1.6.3** | TFT controller driver; provides `Adafruit_ILI9341.h` | Display |
+| **Adafruit GFX Library** | Adafruit | **1.12.6** | Text, shapes, logo and loading animation; provides `Adafruit_GFX.h` | Display |
+| **Adafruit BusIO** | Adafruit | **1.17.4** | Bus access dependency used by the Adafruit graphics libraries | Display |
+| **JPEGDecoder** | Bodmer | **2.0.0** | Album-cover JPEG decoding; provides `JPEGDecoder.h` | Display |
+
+Adafruit ILI9341 also declares **Adafruit STMPE610**, **Adafruit TouchScreen**
+and **Adafruit TSC2007** as dependencies. Let Library Manager install them if
+prompted; this firmware does not use their touch functionality and does not
+require a touch module. These additional dependencies are not individually
+pinned in `sketch.yaml`.
+
+For the simplest setup, install all six table entries even if you plan to build
+headless. A manually configured headless build (`PLAYER_HAS_DISPLAY=0`) only
+needs ArduinoJson and MFRC522 from this table; the CLI profiles deliberately
+list the full set so the same profile can build either variant.
+
+#### Already included — do not install separately
+
+The ESP32 board package supplies `WiFi`, `WiFiClientSecure`, `HTTPClient`,
+`WebServer`, `ESPmDNS`, `DNSServer`, `Preferences`, `SPI`, `SPIFFS`, `FS`,
+`Update`, FreeRTOS, mbedTLS and the ESP-IDF HTTPS server headers.
+The project's `SpotifyClient.h` and `SafeNdef.h` are included in this repository.
+You do **not** need a separate Spotify client, NDEF library, WiFiManager,
+ESPAsyncWebServer, or an ArduinoOTA library for this firmware.
+
+#### Check the installation
+
+After completing the credential/HTTPS setup below, click **Verify** in Arduino
+IDE. A missing `ArduinoJson.h`, `MFRC522.h`, `Adafruit_ILI9341.h`,
+`Adafruit_GFX.h`, or `JPEGDecoder.h` points to the corresponding table entry.
+Missing `secrets.h` is a provisioning step, not a missing library: copy
+`secrets.example.h` as described below. If compilation reports multiple copies
+of a library, inspect the selected path in the build output and remove stale
+manual duplicates from the sketchbook libraries folder. A “Sketch too big”
+error calls for checking the partition setting, not installing another library.
+
 ### 1. Configure the player
 
 Open `rfid_spotify.ino` in Arduino IDE, or run the following commands from the project directory.
@@ -131,7 +207,7 @@ The scheme, hostname, path, and trailing slash must match the firmware's redirec
 
 ### 4. Build and upload
 
-In Arduino IDE, install the dependencies listed in [sketch.yaml](sketch.yaml), then select:
+After following the [Arduino dependency installation guide](#0-install-arduino-board-support-and-libraries), select these settings in Arduino IDE:
 
 | Setting | Value |
 | --- | --- |
@@ -564,6 +640,12 @@ The player checks Spotify about every30seconds while idle. Two successful checks
 The warning clears when the speaker is found again or a play command succeeds. Recovery returns to the startup screen; it does not automatically restart audio. Detection usually takes30–60seconds but can take longer during network problems, API cooldowns or queued work. This detects availability through Spotify, not whether sound is physically audible.
 
 ### Wireless firmware updates
+
+**OTA (over-the-air) updates are supported for both display and headless players.**
+You upload a compiled application through the browser; no USB connection or
+Arduino IDE network port is needed after the initial USB installation. Updates
+are manually initiated: the player does not check GitHub or install new versions
+automatically. No additional OTA library needs to be installed.
 
 1. Install the OTA-enabled sketch **once over USB**, with ESP32 Dev Module and Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS). Keep erase-all-flash disabled.
 2. For future updates, compile the desired version with the same board/partition settings and this player's screen configuration and HTTPS identity. In Arduino IDE choose **Sketch → Export Compiled Binary**.

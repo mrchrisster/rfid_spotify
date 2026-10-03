@@ -10,6 +10,7 @@ Updated: 2026-09-21. Paths below are repository-relative unless absolute.
 - `DeviceConfig.h`: `PLAYER_HAS_DISPLAY=1`, `PLAYER_REQUIRE_WEB_AUTH=0` (explicit internal-LAN user preference), `PLAYER_RFID_DEBUG=0`. Headless build uses `-DPLAYER_HAS_DISPLAY=0`.
 
 ## Stack / build
+- README Setup step0 documents manual Arduino IDE installation matching sketch.yaml. Display dependencies conditional on PLAYER_HAS_DISPLAY; both CLI profiles retain full library list. Adafruit ILI9341 declares unused touch-library dependencies; accept Library Manager dependencies without implying touch hardware support. OTA uses core Update, no separate ArduinoOTA library.
 - `sketch.yaml` pins Arduino-ESP32 3.3.11, ArduinoJson 7.4.3, MFRC522 1.4.12, Adafruit ILI9341 1.6.3, GFX 1.12.6, BusIO 1.17.4, JPEGDecoder 2.0.0.
 - Root sketch: `rfid_spotify.ino`; Arduino compiles sibling `.cpp` files.
 - Installed CLI on current host: `/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli`.
