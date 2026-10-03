@@ -1,6 +1,6 @@
 # Spotify RFID Audiobook Player
 
-**This repository root is the maintained project.** Open `rfid_spotify.ino` from a folder named `rfid_spotify` in Arduino IDE, or build from this directory with the CLI instructions below.
+**This repository root is the maintained project.** Open `rfid_spotify-main.ino` from a folder named `rfid_spotify-main` in Arduino IDE, or build from this directory with the CLI instructions below.
 
 Original ESP32 + MFRC522 → Spotify Connect → Echo, with optional ILI9341 display. Display and headless variants share this codebase.
 
@@ -8,7 +8,7 @@ Previous ESP32, Raspberry Pi and NanoPC versions are preserved in [archive/legac
 
 | Location | Purpose |
 |---|---|
-| `rfid_spotify.ino`, root `.h` / `.cpp` | Current firmware |
+| `rfid_spotify-main.ino`, root `.h` / `.cpp` | Current firmware |
 | `assets/`, `tools/` | Display artwork and provisioning/development tools |
 | `tests/` | Host regression suite |
 | `.ai/`, `AGENTS.md` | Architecture, decisions and session handoff |
@@ -78,6 +78,20 @@ The default pin assignments are for the original ESP32:
 Use a common ground and the supply voltage required by each module. The reader and display share SPI, with separate chip-select signals. Screenless builds keep the same reader pin assignments.
 
 ## Setup
+
+Download **Code → Download ZIP** from the `main` branch and extract it. Keep the
+folder named `rfid_spotify-main` and open `rfid_spotify-main.ino` inside it.
+Arduino requires the main sketch and containing folder to have matching names.
+If cloning with Git, specify the matching destination:
+
+```sh
+git clone https://github.com/mrchrisster/rfid_spotify.git rfid_spotify-main
+```
+
+If Arduino offers to move the sketch into a new folder, cancel and correct the
+containing folder name instead; the sibling headers and `.cpp` files must stay
+with the sketch. Existing clones named `rfid_spotify` should be renamed to
+`rfid_spotify-main` after pulling this change.
 
 Quick links: [Arduino libraries and board package](#0-install-arduino-board-support-and-libraries) · [Build and upload](#4-build-and-upload) · [Wireless firmware updates (OTA)](#wireless-firmware-updates) · [Display/headless variants](#display-and-headless-update-variants).
 
@@ -157,7 +171,7 @@ error calls for checking the partition setting, not installing another library.
 
 ### 1. Configure the player
 
-Open `rfid_spotify.ino` in Arduino IDE, or run the following commands from the project directory.
+Open `rfid_spotify-main.ino` in Arduino IDE, or run the following commands from the project directory.
 
 ```sh
 cp secrets.example.h secrets.h
@@ -596,7 +610,7 @@ Dashboard commands are asynchronous: **202 plus a job ID means queued**, not com
 
 | File | Responsibility |
 | --- | --- |
-| [Main sketch](rfid_spotify.ino) | Startup, task coordination, hardware, and HTTP routes |
+| [Main sketch](rfid_spotify-main.ino) | Startup, task coordination, hardware, and HTTP routes |
 | [SpotifyClient.cpp](SpotifyClient.cpp) | Spotify API, access-token refresh, playback, and rate limiting |
 | [Dashboard.h](Dashboard.h) | Browser dashboard and job polling |
 | [SafeNdef.h](SafeNdef.h), [RfidReader.h](RfidReader.h) | Bounded NDEF parsing and card reads |
@@ -649,7 +663,7 @@ automatically. No additional OTA library needs to be installed.
 
 1. Install the OTA-enabled sketch **once over USB**, with ESP32 Dev Module and Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS). Keep erase-all-flash disabled.
 2. For future updates, compile the desired version with the same board/partition settings and this player's screen configuration and HTTPS identity. In Arduino IDE choose **Sketch → Export Compiled Binary**.
-3. On the same LAN, open the player's web UI → **Settings → Firmware update**. Select `rfid_spotify.ino.bin` (the application binary). Do **not** select `.merged.bin`, `.bootloader.bin` or `.partitions.bin`.
+3. On the same LAN, open the player's web UI → **Settings → Firmware update**. Select `rfid_spotify-main.ino.bin` (the application binary). Do **not** select `.merged.bin`, `.bootloader.bin` or `.partitions.bin`.
 4. Click **Upload and restart player**. Keep power connected. The browser and TFT show progress; card reading and network commands temporarily stop. Echo audio already playing may continue independently.
 5. After the success message, wait for the player to reboot, reload the page and check the firmware build in Diagnostics. For the first OTA test, uploading the same version is sufficient; then verify card playback, credentials and bookmarks.
 

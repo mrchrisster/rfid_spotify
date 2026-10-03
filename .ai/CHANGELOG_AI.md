@@ -238,3 +238,6 @@ This entry summarizes earlier work; it is not a claim that all changes occurred 
 
 ## 2026-10-03 — Fix archived filename rejected by Arduino IDE
 - User reported settings copy.h cannot be used; located file under archive/legacy-versions/esp32-display, renamed settings_copy.h without content changes. Archive README explains rename. Recursive source filename check passes; git diff whitespace check passes. No firmware rebuild/upload; user IDE confirmation pending.
+
+## 2026-10-03 — Match main sketch to GitHub ZIP folder
+- Renamed public root sketch rfid_spotify.ino → rfid_spotify-main.ino at user request; README explains ZIP/clone folder naming and preserving sibling sources, OTA application filename updated. Persistent checkout moved to github/rfid_spotify-main; original hardware sketch unchanged. Verified byte-identical rename; no runtime changes or device upload.
