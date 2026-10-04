@@ -28,6 +28,7 @@ with tempfile.TemporaryDirectory(prefix="spotify-tests-") as temporary:
         ("oauth", ["tests/test_oauth.cpp"], []),
         ("certificate", ["tests/test_certificate_policy.cpp"], []),
         ("rfid", ["tests/test_rfid.cpp"], []),
+        ("pn532", ["tests/test_pn532.cpp"], []),
         ("rfid_presence", ["tests/test_rfid_presence.cpp"], []),
         ("artwork_spool", ["tests/test_artwork_spool.cpp"], ["-Itests/fakes/spool"]),
         ("artwork", ["tests/test_artwork.cpp"], [
@@ -35,6 +36,10 @@ with tempfile.TemporaryDirectory(prefix="spotify-tests-") as temporary:
             "-DARDUINOJSON_ENABLE_ARDUINO_PRINT=0", "-DARDUINOJSON_ENABLE_PROGMEM=0", "-I" + str(args.arduino_json),
         ]),
         ("firmware_update", ["tests/test_firmware_update.cpp"], ["-Itests/fakes/ota",
+            "-DARDUINOJSON_ENABLE_ARDUINO_STRING=1", "-DARDUINOJSON_ENABLE_ARDUINO_STREAM=0",
+            "-DARDUINOJSON_ENABLE_ARDUINO_PRINT=0", "-DARDUINOJSON_ENABLE_PROGMEM=0", "-I" + str(args.arduino_json),
+        ]),
+        ("firmware_update_c6", ["tests/test_firmware_update.cpp"], ["-Itests/fakes/ota", "-DCONFIG_IDF_TARGET_ESP32C6=1",
             "-DARDUINOJSON_ENABLE_ARDUINO_STRING=1", "-DARDUINOJSON_ENABLE_ARDUINO_STREAM=0",
             "-DARDUINOJSON_ENABLE_ARDUINO_PRINT=0", "-DARDUINOJSON_ENABLE_PROGMEM=0", "-I" + str(args.arduino_json),
         ]),

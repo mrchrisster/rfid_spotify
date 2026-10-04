@@ -241,3 +241,16 @@ This entry summarizes earlier work; it is not a claim that all changes occurred 
 
 ## 2026-10-03 — Match main sketch to GitHub ZIP folder
 - Renamed public root sketch rfid_spotify.ino → rfid_spotify-main.ino at user request; README explains ZIP/clone folder naming and preserving sibling sources, OTA application filename updated. Persistent checkout moved to github/rfid_spotify-main; original hardware sketch unchanged. Verified byte-identical rename; no runtime changes or device upload.
+
+## 2026-10-03 — Investigate optional PN532 reader
+- Inspected current MFRC-specific I/O, register recovery, presence latch and common NDEF/playback flow; consulted Adafruit driver/NXP manual. Asked user module/transport before hardware-specific implementation. No source/dependency changes, tests/builds or device operations; PN532 support remains pending.
+
+- PN532 follow-up: user thought legacy version existed. Checked GitHub remote heads/tags (main only), fetched main and searched source/docs in all87 reachable commits; no PN532 references. Archived ESP32/NDEF/display sketches use MFRC522. No code/build/device changes; selected PN532 module/interface still needed.
+
+- User supplied modified legacy PN532 sketch; identified I2C100kHz/SDA11/SCL10/IRQ9/reset3, standard-header incompatibility in NDEF calls and unverified board mapping. Recorded durable conclusions without copying provisioning contents. Read-only analysis; no compile, new driver or device operation.
+
+## 2026-10-03 — Implement hardware profiles and C6 PN532 option
+- Added HardwareProfile.h, Pn532.h, Pn532Wire.h and profile build script; PN532 NDEF reads route through shared SafeNdef/playback/presence. MFRC default unchanged. Board/display mismatch compile guards, Diagnostics profile/reader fields, README wiring/dependencies/build names. C6 CLI dependency profile only needs ArduinoJson; no third-party PN532 dependency.
+- Fixed OTA header validation for C6 while rejecting other chip family. Tests added for wire-frame protocol validation, finite errors/timeouts/rollover, presence retention/absence, NDEF/Type2 boundary capacities/Classic mapping, profile mismatch and OTA both-chip rejection. Early sanitizer run found pointer arithmetic cache+offset-base; corrected to cache+(offset-base). Final validation results follow; no hardware upload.
+
+- Final validation passed: full host regression suite (native sanitizer,12 Python cases incl profile target/display rejection,JS); all three unprovisioned builds fit min_spiffs OTA: TFT1547752B/78%, globals68560B; ESP32 headless1420016B/72%, globals63040B; C6 PN5321567662B/79%, globals59780B. Example secrets removed after compile. No generated binaries/private identity committed or device flashed. Physical PN532/held-card/recovery/OTA checks remain pending.

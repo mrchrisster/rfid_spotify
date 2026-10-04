@@ -1,13 +1,13 @@
 # Architecture
 
-Updated: 2026-09-21. Paths below are repository-relative unless absolute.
+Updated: 2026-10-03. Paths below are repository-relative unless absolute.
 
 ## Product / hardware
 - Audiobook player: RFID card → Spotify URI → Spotify Connect playback on chosen Echo. ESP32 controls playback; Echo streams audio. No local audio decoding.
-- Physical chip verified by esptool: **original ESP32**, not ESP32-C6. Keep existing wiring. `sketch.yaml` still contains an experimental C6 profile; it is not the deployed target.
+- Two devices: original ESP32/MFRC522 (hardware-tested), and user-confirmed ESP32-C6 dual USB-C/PN532 I2C (new driver awaits hardware test). Preserve original ESP32 SPI wiring; C6 uses separate user-supplied wiring/profile.
 - Default board: ESP32 Dev Module, ≥4 MB flash, `PartitionScheme=min_spiffs`: 1,966,080-byte app slots, 128 KB SPIFFS. Browser application OTA uses the inactive slot; bootloader/partition updates still require USB.
 - Shared SPI: SCK18/MISO19/MOSI23; MFRC522 CS5/reset4; ILI9341 TFT CS15/DC2/reset22; landscape 320×240. Only hardware worker may draw/poll this bus.
-- `DeviceConfig.h`: `PLAYER_HAS_DISPLAY=1`, `PLAYER_REQUIRE_WEB_AUTH=0` (explicit internal-LAN user preference), `PLAYER_RFID_DEBUG=0`. Headless build uses `-DPLAYER_HAS_DISPLAY=0`.
+- HardwareProfile.h selects board/reader/display via PLAYER_DEFAULT_PROFILE or build override PLAYER_HARDWARE_PROFILE=1/2/3. Original ESP32 TFT default; legacy PLAYER_HAS_DISPLAY=0 selects original ESP32 headless. DeviceConfig.h retains LAN-auth disabled/debug off defaults.
 
 ## Stack / build
 - README Setup step0 documents manual Arduino IDE installation matching sketch.yaml. Display dependencies conditional on PLAYER_HAS_DISPLAY; both CLI profiles retain full library list. Adafruit ILI9341 declares unused touch-library dependencies; accept Library Manager dependencies without implying touch hardware support. OTA uses core Update, no separate ArduinoOTA library.
@@ -237,3 +237,15 @@ Updated: 2026-09-21. Paths below are repository-relative unless absolute.
 - A26 archive filename correction: preserve old settings copy as `archive/legacy-versions/esp32-display/settings_copy.h`; Arduino IDE reported rejecting space-containing original despite archive location. CLI compilation alone did not expose this IDE compatibility issue.
 
 - A26 naming decision superseded (2026-10-03): user prefers GitHub Download ZIP workflow. Public main sketch is now rfid_spotify-main.ino, folder rfid_spotify-main; clone destination must explicitly match. Persistent checkout github/rfid_spotify-main. Source bytes unchanged; default git-clone basename no longer matches automatically. Original provisioned hardware workspace untouched.
+
+## PN532 reader option — investigation, not implemented (2026-10-03)
+- User requests alternate PN532 reader. SafeNdef parser/playback queue can be shared; current RfidReader.h and sketch polling/health/reset use MFRC522 types/registers directly. Do not emulate MFRC register health for PN532. Interface/module choice pending user response; retain default MFRC hardware configuration.
+- Primary references inspected: https://github.com/adafruit/Adafruit-PN532 and NXP PN532 user manual https://www.nxp.com/docs/en/user-guide/141520.pdf . Need bounded polling, transport faults distinct from confirmed no-card responses, UID/card-type/length validation and supported NDEF tag reads. Existing presence state must survive recovery so a held card does not replay. No library selected or new hardware support claimed.
+
+- PN532 supplied legacy source: Adafruit_PN532 over TwoWire(0),100kHz, SDA11/SCL10/IRQ9/reset3. Target board unknown; these pins conflict with flash on typical original ESP32 modules. Source calls nonstandard readNDEF and Adafruit_NdefMessage/Record (not in standard Adafruit driver header); cannot assume it compiles unchanged. Existing SafeNdef/presence logic should replace its unbounded payload/naive URI conversion and repeated held-card playback.
+
+## A27 — Hardware profiles and C6 PN532 I2C (2026-10-03)
+- User approved esp32-mfrc522-tft (1), esp32-mfrc522-headless (2), esp32c6-pn532-headless (3). HardwareProfile.h owns selection/chip guards/display/pin constants. C6: Wire controller0, SDA11/SCL10/IRQ9/reset3,100kHz, address0x24; no original SPI pin initialization. No runtime reader switching; board/pins require compile-time selection. Profiles surfaced in boot and /api/status/Dashboard diagnostics. Builder tools/build_firmware.py emits profile-named .bin under ignored build/ with matching FQBN/min_spiffs. No automated firmware publication/update.
+- Pn532.h/Pn532Wire.h: small NXP normal-frame host protocol with fake transport tests, core Wire only. Chosen instead of copying supplied unbuildable readNDEF API or conflating Adafruit poll false with no-card. Check ACK/preamble/LEN/LCS/TFI/response cmd/DCS/postamble, bound frame64B/UID10B; reject wrong/malformed/oversize replies. Driver supports firmware query/SAM/finite retry config/InListPassiveTarget/InDataExchange/InRelease only. Asynchronous RF response wait preserves worker responsiveness; ack/command/I2C calls bounded. No infinite activation retry. Timeout/corruption => reader fault/recovery, never absence.
+- PN532 release after read/held poll; new detection uses chip selection SAK (Classic1K0x08, Type2=0), not UID size heuristic. Pn532Ndef uses same SafeNdef as MFRC, final Type2 group stays within CC bound, Classic blocks4..62 excluding trailers with standard NDEF key and last4 UID auth bytes. No MIFARE4K/DESFire/raw legacy text support. Faults keep RfidPresence UID;1.5s explicit zero-target replies rearm. MFRC path retains original register health/reset/cooldown and card logic. PN recovery physical reset/firmware/SAM config limited by existing5s cooldown and30s failure-log throttle.
+- FirmwareUpdateState.h checks native image chip id (C6=0x000d,ESP32=0); both tested. Does not validate same-chip hardware-profile metadata. No change to token/bookmark persistence or private identity. New driver has host/protocol coverage only until physical card/reader/OTA tests complete.

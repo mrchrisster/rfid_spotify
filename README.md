@@ -2,7 +2,7 @@
 
 **This repository root is the maintained project.** Open `rfid_spotify-main.ino` from a folder named `rfid_spotify-main` in Arduino IDE, or build from this directory with the CLI instructions below.
 
-Original ESP32 + MFRC522 → Spotify Connect → Echo, with optional ILI9341 display. Display and headless variants share this codebase.
+ESP32 + MFRC522 (optional ILI9341 display), or ESP32-C6 + PN532 (headless) → Spotify Connect → Echo. All hardware profiles share this codebase.
 
 Previous ESP32, Raspberry Pi and NanoPC versions are preserved in [archive/legacy-versions](archive/legacy-versions/README.md). They are historical references, not alternative current releases.
 
@@ -22,7 +22,7 @@ Previous ESP32, Raspberry Pi and NanoPC versions are preserved in [archive/legac
 Play audiobooks on an Echo or another Spotify Connect speaker by placing an RFID card on a reader. Cards can select albums, playlists, tracks, shows, episodes, or an artist's album catalog. An optional ILI9341 screen displays album artwork, while a local web dashboard provides playback controls and Spotify account setup.
 
 ```text
-RFID card → ESP32 + MFRC522 → Spotify Web API → Spotify Connect speaker
+RFID card → ESP32/MFRC522 or ESP32-C6/PN532 → Spotify Web API → Spotify Connect speaker
                    ↕
              Web dashboard
 ```
@@ -46,12 +46,12 @@ The ESP32 controls playback; the speaker streams the audio. The speaker must alr
 ### Hardware
 
 - An ESP32 development board with at least 4 MB flash for the documented partition layout.
-- An MFRC522 RFID reader and supported NDEF cards.
+- An MFRC522 SPI reader, or a PN532 in I²C mode for the C6 profile, and supported NDEF cards.
 - Optional ILI9341 TFT display.
 - A stable power supply and Wi-Fi with internet access.
 - An Echo or another speaker available to the same Spotify account through Spotify Connect.
 
-The hardware-tested target is an **original ESP32**, using **ESP32 Dev Module** in Arduino IDE. A separate ESP32-C6 build profile is included, but C6 hardware and its pin mapping have not been validated. Select the board matching the actual chip.
+The original ESP32/MFRC522 configuration has device testing. The ESP32-C6/PN532 profile uses the user’s previously working I²C wiring; this new PN532 implementation still needs physical validation. Select both the hardware profile and matching Arduino board below.
 
 ### Software and account
 
@@ -76,6 +76,72 @@ The default pin assignments are for the original ESP32:
 | TFT reset | 22 | Optional display reset |
 
 Use a common ground and the supply voltage required by each module. The reader and display share SPI, with separate chip-select signals. Screenless builds keep the same reader pin assignments.
+
+## Hardware profiles
+
+In [HardwareProfile.h](HardwareProfile.h), change **one line** to select your device:
+
+```cpp
+#define PLAYER_DEFAULT_PROFILE PLAYER_ESP32C6_PN532_HEADLESS
+```
+
+| Profile name | `PLAYER_DEFAULT_PROFILE` value | Arduino board | Reader / display |
+| --- | --- | --- | --- |
+| `esp32-mfrc522-tft` (default) | `PLAYER_ESP32_MFRC522_TFT` | ESP32 Dev Module | MFRC522 SPI; TFT enabled |
+| `esp32-mfrc522-headless` | `PLAYER_ESP32_MFRC522_HEADLESS` | ESP32 Dev Module | MFRC522 SPI; no screen |
+| `esp32c6-pn532-headless` | `PLAYER_ESP32C6_PN532_HEADLESS` | ESP32C6 Dev Module | PN532 I²C; no screen |
+
+Compile-time checks reject a board/profile mismatch or conflicting display override.
+Reader selection is a build option, not a web setting. Diagnostics and boot logs show
+the installed profile and reader. Wi-Fi, Spotify, bookmarks and web controls are shared.
+
+### PN532 wiring for ESP32-C6
+
+| PN532 signal | C6 GPIO |
+| --- | --- |
+| SDA | 11 |
+| SCL | 10 |
+| IRQ | 9 |
+| Reset input (RSTPD_N / RST) | 3 |
+
+Set the module’s switches/jumpers to **I²C** according to its documentation.
+Connect common ground and the supply appropriate for your module; ESP32 signals
+must remain 3.3 V compatible. Do not confuse a module’s reset output with its
+reset input. The driver uses I²C address `0x24` at 100 kHz and requires IRQ/reset.
+These are the user's existing C6 pins; do not apply them to an original ESP32.
+The C6 profile does not initialize the original reader/display SPI pins.
+If your C6 currently runs the older MFRC-only firmware, install this version
+once over USB: that older firmware’s OTA validator rejects C6 application images.
+
+No Adafruit PN532/NDEF library is required: [Pn532.h](Pn532.h) implements the
+bounded reader commands and [Pn532Wire.h](Pn532Wire.h) uses the ESP32 core's Wire
+library. This lets polling distinguish confirmed absence from transport failure
+and validate response lengths/checksums before parsing a card. Both readers use
+[SafeNdef.h](SafeNdef.h), supporting Type 2 Ultralight/NTAG and NDEF-formatted
+MIFARE Classic 1K cards. Old raw-text cards may need rewriting as NDEF.
+A held card triggers once; removal for at least 1.5 seconds rearms it. Reader
+communication faults retain the held-card latch and trigger bounded recovery.
+
+### Build a named firmware file
+
+After installing dependencies and provisioning credentials, run one of:
+
+```sh
+python3 tools/build_firmware.py esp32-mfrc522-tft
+python3 tools/build_firmware.py esp32-mfrc522-headless
+python3 tools/build_firmware.py esp32c6-pn532-headless
+```
+
+The script selects board, partition and profile together and prints the application
+file, e.g. `build/esp32c6-pn532-headless/esp32c6-pn532-headless.bin`.
+Use `--cli /path/to/arduino-cli` if the CLI is not on PATH. Dependencies must already
+be installed. These local firmware files contain your provisioning data; do not publish them.
+For CLI profile dependency installation, the C6 equivalent is:
+
+```sh
+arduino-cli compile --profile esp32c6-review \
+  --build-property 'compiler.cpp.extra_flags=-DPLAYER_HARDWARE_PROFILE=3' .
+```
 
 ## Setup
 
@@ -114,7 +180,7 @@ the CLI profile instructions below provide the pinned dependency workflow.
 2. Open **Tools → Board → Boards Manager**, search for **esp32**, and install
    **esp32 by Espressif Systems**, version **3.3.11**.
 3. Select **ESP32 Dev Module** for the hardware-tested original ESP32. The
-   experimental C6 profile is not the board used by this player.
+   C6/PN532 device instead requires **ESP32C6 Dev Module** and its matching hardware profile.
 4. Use the flash and partition settings in [Build and upload](#4-build-and-upload).
    OTA requires the documented two-slot partition layout.
 
@@ -145,9 +211,9 @@ require a touch module. These additional dependencies are not individually
 pinned in `sketch.yaml`.
 
 For the simplest setup, install all six table entries even if you plan to build
-headless. A manually configured headless build (`PLAYER_HAS_DISPLAY=0`) only
-needs ArduinoJson and MFRC522 from this table; the CLI profiles deliberately
-list the full set so the same profile can build either variant.
+headless. The original ESP32 headless profile only
+needs ArduinoJson and MFRC522 from this table; C6/PN532 only needs ArduinoJson.
+The ESP32 CLI profile deliberately lists the full set; the same ESP32 profile can build either display variant.
 
 #### Already included — do not install separately
 
@@ -184,9 +250,8 @@ changing networks does not require reflashing.
 
 Leave `refreshToken` empty to authorize through the web dashboard. It is an optional bootstrap credential: once a token is saved on the device, the saved token takes precedence over this field.
 
-For a screenless player, set `PLAYER_HAS_DISPLAY` to `0` in
-[DeviceConfig.h](DeviceConfig.h). The default is `1` for the TFT version.
-For a reader-isolation test, `0` disables display traffic while keeping RFID,
+For a screenless player, select the appropriate headless [hardware profile](#hardware-profiles).
+The original ESP32 headless profile disables display traffic while keeping RFID,
 Spotify, and the web dashboard enabled; it does not electrically disconnect
 the display module.
 
@@ -225,7 +290,7 @@ After following the [Arduino dependency installation guide](#0-install-arduino-b
 
 | Setting | Value |
 | --- | --- |
-| Board | ESP32 Dev Module |
+| Board | ESP32 Dev Module, or ESP32C6 Dev Module for the C6/PN532 profile |
 | Flash size | Match the physical board; at least 4 MB for this layout |
 | Partition scheme | Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS) |
 | Erase All Flash | Disabled when preserving saved settings |
@@ -661,7 +726,7 @@ Arduino IDE network port is needed after the initial USB installation. Updates
 are manually initiated: the player does not check GitHub or install new versions
 automatically. No additional OTA library needs to be installed.
 
-1. Install the OTA-enabled sketch **once over USB**, with ESP32 Dev Module and Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS). Keep erase-all-flash disabled.
+1. Install the OTA-enabled sketch **once over USB**, with the board matching your hardware profile and Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS). Keep erase-all-flash disabled.
 2. For future updates, compile the desired version with the same board/partition settings and this player's screen configuration and HTTPS identity. In Arduino IDE choose **Sketch → Export Compiled Binary**.
 3. On the same LAN, open the player's web UI → **Settings → Firmware update**. Select `rfid_spotify-main.ino.bin` (the application binary). Do **not** select `.merged.bin`, `.bootloader.bin` or `.partitions.bin`.
 4. Click **Upload and restart player**. Keep power connected. The browser and TFT show progress; card reading and network commands temporarily stop. Echo audio already playing may continue independently.
@@ -675,9 +740,9 @@ USB remains the recovery route if newly installed firmware cannot boot or join W
 
 ### Display and headless update variants
 
-Both variants support USB installation and browser OTA. Before compiling/exporting, set `PLAYER_HAS_DISPLAY` in `DeviceConfig.h` to `1` for TFT, or `0` for no screen (CLI can override it with `-DPLAYER_HAS_DISPLAY=0`). Keep the ESP32 Dev Module / Minimal SPIFFS board settings for both.
+All three [hardware profiles](#hardware-profiles) support USB installation and browser OTA. Select the profile in HardwareProfile.h and its matching board, or use tools/build_firmware.py to select both together. Keep Minimal SPIFFS for all three. Legacy -DPLAYER_HAS_DISPLAY=0 remains available for the original ESP32 headless build.
 
-The firmware update section displays the **currently installed** variant. The uploaded binary selects the new variant; there is no runtime dropdown that converts firmware. The updater does not reject the other screen variant. Export builds separately and label the application files, e.g. `storyplayer-display.bin` and `storyplayer-headless.bin`, to avoid mixing them. Preserve the correct per-device HTTPS identity when building for two devices. Each device needs an OTA-enabled USB installation first.
+The firmware update section displays the **currently installed** variant. The uploaded binary selects the new variant; there is no runtime dropdown that converts firmware. The updater rejects firmware for the other chip family (ESP32 versus C6), but does not reject the other screen variant on the same chip. Export builds separately and label the application files, e.g. `storyplayer-display.bin` and `storyplayer-headless.bin`, to avoid mixing them. Preserve the correct per-device HTTPS identity when building for two devices. Each device needs an OTA-enabled USB installation first.
 
 ### Flash write endurance
 

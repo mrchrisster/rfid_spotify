@@ -1,5 +1,7 @@
 #pragma once
-// Build with -DPLAYER_HAS_DISPLAY=0 for a screenless RFID player.
+// Hardware profile selects reader, board and display; see HardwareProfile.h.
+#include "HardwareProfile.h"
+// Legacy -DPLAYER_HAS_DISPLAY=0 still selects original ESP32 headless.
 // Authentication and control remain available through the same web UI.
 #ifndef PLAYER_HAS_DISPLAY
 #define PLAYER_HAS_DISPLAY 1

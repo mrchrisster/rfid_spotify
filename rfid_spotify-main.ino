@@ -35,7 +35,12 @@
 #include <esp_heap_caps.h>
 #include <atomic>
 #include <vector>
+#if PLAYER_READER_PN532
+#include "Pn532.h"
+#include "Pn532Wire.h"
+#else
 #include "RfidReader.h"
+#endif
 #include "RfidPresence.h"
 #include "RfidRecovery.h"
 #include "Reliability.h"
@@ -50,7 +55,12 @@ const char firmwareBuild[] = __DATE__ " " __TIME__;
 #if PLAYER_HAS_DISPLAY
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 #endif
+#if PLAYER_READER_PN532
+Pn532Wire pn532Wire;
+Pn532<Pn532Wire> reader(pn532Wire);
+#else
 MFRC522 reader(SS_PIN, MFRC522::UNUSED_PIN);
+#endif
 RfidPresence cardPresence;
 CardRestart cardRestart; // Hardware owner; gesture does not survive reboot.
 std::atomic<uint8_t> speakerHealth{SpeakerHealth::Unknown};
@@ -504,6 +514,7 @@ void networkWorker(void*) {
   }
 }
 
+#if !PLAYER_READER_PN532
 RfidRecovery::Registers readerRegisters() {
   return {reader.PCD_ReadRegister(MFRC522::VersionReg), reader.PCD_ReadRegister(MFRC522::TxControlReg),
     reader.PCD_ReadRegister(MFRC522::TModeReg), reader.PCD_ReadRegister(MFRC522::TPrescalerReg),
@@ -561,12 +572,48 @@ bool readerHealth(bool force, const char* reason) {
   }
   rfidVersion=registers.version; rfidOk=registers.healthy(); return registers.healthy();
 }
+#else
+bool readerHealth(bool force, const char* reason) {
+  static RfidRecovery::Cooldown cooldown;
+  static bool reported=false;static uint32_t logAt=0;
+  if(!force && rfidOk)return true; // Every valid PN532 poll response verifies communication.
+  cardPresence.uncertain();rfidOk=false;
+  if(!cooldown.acquire(millis()))return false;
+  ++recoveries;bool ready=reader.begin();rfidVersion=reader.version;rfidOk=ready;
+  if(ready){logMessage("[RFID] PN532 ready ("+String(reason)+")");reported=false;}
+  else if(!reported || millis()-logAt>=30000){
+    logMessage("[RFID] PN532 unavailable; check I2C mode/wiring; retrying automatically");
+    reported=true;logAt=millis();
+  }
+  return ready;
+}
+#endif
+void finishCard() {
+#if PLAYER_READER_PN532
+  if(!reader.release()){cardPresence.uncertain();rfidOk=false;}
+#else
+  reader.PICC_HaltA();reader.PCD_StopCrypto1();
+#endif
+}
 void pollCard() {
   if(restartRequested)return;
   static uint8_t errors = 0;
   uint32_t now = millis(), previousPoll = lastPoll.exchange(now);
   if (previousPoll && now - previousPoll > maxPollGap) maxPollGap = now - previousPoll;
   if (!rfidOk) { cardPresence.uncertain(); return; }
+#if PLAYER_READER_PN532
+  auto result=reader.poll();
+  if(result==Pn532<Pn532Wire>::Poll::Pending)return;
+  if(result==Pn532<Pn532Wire>::Poll::Absent){
+    if(cardPresence.missing(millis(),true))logMessage("[RFID] Card removed; ready for next presentation");
+    errors=0;return;
+  }
+  if(result==Pn532<Pn532Wire>::Poll::Error){
+    ++readFailures;cardPresence.uncertain();rfidOk=false;
+    readerHealth(true,"PN532 communication failure");return;
+  }
+  cardPresence.uncertain();
+#else
   digitalWrite(TFT_CS, HIGH);
   reader.PCD_StopCrypto1();
   uint8_t atqa[2], atqaSize = sizeof(atqa);
@@ -589,8 +636,9 @@ void pollCard() {
     if (++errors >= 3) { readerHealth(true, "three consecutive wakeup/selection/read errors"); errors = 0; }
     return;
   }
+  #endif
   if (!cardPresence.seen(reader.uid.uidByte,reader.uid.size)) {
-    reader.PICC_HaltA(); reader.PCD_StopCrypto1(); errors=0; return;
+    finishCard(); errors=0; return;
   }
   ++scans;
 #if PLAYER_HAS_DISPLAY
@@ -602,8 +650,13 @@ void pollCard() {
   }
 #endif
   char uri[SafeNdef::MaxUri] = {};
-  RfidReader tag(reader); bool valid = tag.spotifyUri(uri, sizeof(uri));
-  reader.PICC_HaltA(); reader.PCD_StopCrypto1();
+#if PLAYER_READER_PN532
+  Pn532Ndef<Pn532<Pn532Wire>> tag(reader);
+#else
+  RfidReader tag(reader);
+#endif
+  bool valid = tag.spotifyUri(uri, sizeof(uri));
+  finishCard();
   if (!valid) {
     cardRestart.clear();
 #if PLAYER_HAS_DISPLAY
@@ -612,7 +665,7 @@ void pollCard() {
     ++readFailures;
     logMessage(tag.ioError ? "[RFID] Card read failed; remove and retry" : "[RFID] Unsupported or malformed Spotify NDEF record");
     if (tag.ioError) {
-#if PLAYER_RFID_DEBUG
+#if PLAYER_RFID_DEBUG && !PLAYER_READER_PN532
       logMessage("[RFID] " + String(tag.errorOperation) + " failed: address=" + String(tag.errorAddress) +
         " status=" + String(int(tag.lastStatus)) + " (" + String(MFRC522::GetStatusCodeName(tag.lastStatus)) +
         ") bytes=" + String(tag.responseBytes));
@@ -702,9 +755,11 @@ bool decodeCover(uint8_t* bytes, size_t size, bool draw, bool flashImage=false) 
 }
 #endif
 void hardwareWorker(void*) {
+#if !PLAYER_READER_PN532
   pinMode(SS_PIN, OUTPUT); digitalWrite(SS_PIN, HIGH);
   pinMode(TFT_CS, OUTPUT); digitalWrite(TFT_CS, HIGH); pinMode(RST_PIN, OUTPUT);
   SPI.begin(18, 19, 23);
+#endif
 #if PLAYER_HAS_DISPLAY
   tft.begin(); tft.setRotation(1); infoScreen();
   logMessage("[Display] TFT enabled; initialization and info-screen draw completed");
@@ -921,6 +976,8 @@ void handleStatus() {
   if (!authorized()) return;
   JsonDocument doc;
   doc["firmware_build"] = firmwareBuild;
+  doc["hardware_profile"] = PLAYER_PROFILE_NAME;
+  doc["reader_type"] = PLAYER_READER_NAME;
   doc["wifi_setup_active"] = WifiSetup::active();
   doc["wifi_setup_ssid"] = WifiSetup::networkName();
   doc["wifi_setup_password"] = WifiSetup::setupPassword();
@@ -1101,6 +1158,7 @@ void setup() {
   #else
   Serial.println("Web UI: login disabled (internal LAN)");
   #endif
+  logMessage("[Boot] Profile " + String(PLAYER_PROFILE_NAME));
   logMessage("[Boot] Build " + String(firmwareBuild) + "; TFT=" + String(PLAYER_HAS_DISPLAY));
   logMessage("[Boot] Reset reason " + String(esp_reset_reason()) + " (" + resetReasonName() + ")");
   WifiSetup::begin(ssid, pass);

@@ -24,14 +24,14 @@ WebServer server;
 void reset(){using namespace FirmwareUpdate;expected=received=headerSize=0;writing=uploaded=success=acceptUpload=false;session="";message="";FirmwareUpdateState::requested=false;FirmwareUpdateState::networkReady=false;FirmwareUpdateState::hardwareReady=false;Update=FakeUpdate{};permitted=true;}
 void prepare(size_t size=100){server.body=String("{\"size\":")+String(size)+"}";server.routes["/api/firmware/prepare"].end();server.nonce=FirmwareUpdate::session;}
 void chunk(int state,std::vector<uint8_t>& data){server.file={state,data.size(),data.data()};server.routes["/api/firmware/upload"].chunk();}
-std::vector<uint8_t> binary(){std::vector<uint8_t> b(100);b[0]=0xe9;b[1]=1;b[32]=0x32;b[33]=0x54;b[34]=0xcd;b[35]=0xab;return b;}
+std::vector<uint8_t> binary(){std::vector<uint8_t> b(100);b[0]=0xe9;b[1]=1;b[12]=FirmwareUpdateState::ChipId;b[32]=0x32;b[33]=0x54;b[34]=0xcd;b[35]=0xab;return b;}
 void start(){prepare();assert(server.code==202);FirmwareUpdateState::networkReady=true;FirmwareUpdateState::hardwareReady=true;std::vector<uint8_t> empty;chunk(UPLOAD_FILE_START,empty);}
 void finish(){std::vector<uint8_t> empty;chunk(UPLOAD_FILE_END,empty);server.routes["/api/firmware/upload"].end();}
 int main(){FirmwareUpdate::attach(server,auth);auto valid=binary();
  reset();prepare(2000000);assert(server.code==400 && !FirmwareUpdateState::requested);
  reset();prepare();chunk(UPLOAD_FILE_START,valid);chunk(UPLOAD_FILE_WRITE,valid);assert(!Update.active); // Workers must quiesce.
  reset();start();std::vector<uint8_t> first(valid.begin(),valid.begin()+17),rest(valid.begin()+17,valid.end());chunk(UPLOAD_FILE_WRITE,first);assert(!Update.active);chunk(UPLOAD_FILE_WRITE,rest);finish();assert(server.code==200 && Update.bytes==valid);testMillis+=3000;FirmwareUpdate::tick();assert(ESP.reboots==1);
- reset();start();auto wrong=valid;wrong[12]=13;chunk(UPLOAD_FILE_WRITE,wrong);finish();assert(server.code==400 && !Update.active);
+ reset();start();auto wrong=valid;wrong[12]=FirmwareUpdateState::ChipId==0?13:0;chunk(UPLOAD_FILE_WRITE,wrong);finish();assert(server.code==400 && !Update.active);
  reset();start();wrong=valid;wrong[32]=0;chunk(UPLOAD_FILE_WRITE,wrong);finish();assert(server.code==400);
  reset();start();chunk(UPLOAD_FILE_WRITE,first);finish();assert(server.code==400 && !FirmwareUpdateState::requested);
  reset();start();wrong=valid;wrong.push_back(0);chunk(UPLOAD_FILE_WRITE,wrong);assert(!FirmwareUpdateState::requested);

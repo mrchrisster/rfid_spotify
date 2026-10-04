@@ -1,0 +1,51 @@
+#pragma once
+#define PLAYER_ESP32_MFRC522_TFT 1
+#define PLAYER_ESP32_MFRC522_HEADLESS 2
+#define PLAYER_ESP32C6_PN532_HEADLESS 3
+
+// Arduino IDE: change this ONE default to the desired named profile.
+#ifndef PLAYER_DEFAULT_PROFILE
+#define PLAYER_DEFAULT_PROFILE PLAYER_ESP32_MFRC522_TFT
+#endif
+// Build tools override the default with -DPLAYER_HARDWARE_PROFILE=1/2/3.
+#ifndef PLAYER_HARDWARE_PROFILE
+#if defined(PLAYER_HAS_DISPLAY) && PLAYER_HAS_DISPLAY == 0 && PLAYER_DEFAULT_PROFILE == PLAYER_ESP32_MFRC522_TFT
+#define PLAYER_HARDWARE_PROFILE PLAYER_ESP32_MFRC522_HEADLESS
+#else
+#define PLAYER_HARDWARE_PROFILE PLAYER_DEFAULT_PROFILE
+#endif
+#endif
+
+#if PLAYER_HARDWARE_PROFILE == PLAYER_ESP32_MFRC522_TFT
+#define PLAYER_PROFILE_NAME "esp32-mfrc522-tft"
+#define PLAYER_PROFILE_DISPLAY 1
+#define PLAYER_READER_PN532 0
+#elif PLAYER_HARDWARE_PROFILE == PLAYER_ESP32_MFRC522_HEADLESS
+#define PLAYER_PROFILE_NAME "esp32-mfrc522-headless"
+#define PLAYER_PROFILE_DISPLAY 0
+#define PLAYER_READER_PN532 0
+#elif PLAYER_HARDWARE_PROFILE == PLAYER_ESP32C6_PN532_HEADLESS
+#define PLAYER_PROFILE_NAME "esp32c6-pn532-headless"
+#define PLAYER_PROFILE_DISPLAY 0
+#define PLAYER_READER_PN532 1
+#else
+#error "Unknown PLAYER_HARDWARE_PROFILE; choose 1, 2 or 3"
+#endif
+#ifndef PLAYER_HAS_DISPLAY
+#define PLAYER_HAS_DISPLAY PLAYER_PROFILE_DISPLAY
+#elif PLAYER_HAS_DISPLAY != PLAYER_PROFILE_DISPLAY
+#error "Display override conflicts with selected hardware profile"
+#endif
+#if defined(ARDUINO_ARCH_ESP32)
+#if PLAYER_READER_PN532 && !defined(CONFIG_IDF_TARGET_ESP32C6)
+#error "PN532 C6 profile requires ESP32C6 Dev Module board"
+#elif !PLAYER_READER_PN532 && !defined(CONFIG_IDF_TARGET_ESP32)
+#error "MFRC522 profiles require ESP32 Dev Module board"
+#endif
+#endif
+// User's existing C6 I2C wiring, never initialized by the original ESP32 profiles.
+#define PLAYER_PN532_SDA 11
+#define PLAYER_PN532_SCL 10
+#define PLAYER_PN532_IRQ 9
+#define PLAYER_PN532_RESET 3
+#define PLAYER_READER_NAME (PLAYER_READER_PN532 ? "PN532 (I2C)" : "MFRC522 (SPI)")
